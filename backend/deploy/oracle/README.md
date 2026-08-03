@@ -1,8 +1,8 @@
-# Migrating the backend from Render to Oracle Cloud Free Tier
+# Deploying the backend to Oracle Cloud Free Tier
 
-Only the Django backend moves. Vercel (frontend) and Supabase (Postgres) stay
-exactly as they are — the backend already reads `DATABASE_URL` via
-`dj-database-url`, so no DB changes are needed.
+The Django backend already reads `DATABASE_URL` via `dj-database-url`, so any
+PostgreSQL instance works — point it at whatever DB you're using in
+production.
 
 ## 1. Create the VM (OCI Console — do this manually)
 
@@ -29,19 +29,19 @@ service and nginx site.
 
 ## 3. Environment variables
 
-Copy every env var from Render's dashboard (Settings → Environment) into
-`/home/ubuntu/tradepulse-ai/backend/.env` on the VM — `DATABASE_URL`, Angel
-One credentials, `SECRET_KEY`, WhatsApp/telegram tokens, etc.
+Create `/home/ubuntu/tradepulse-truedata/backend/.env` on the VM with all the
+vars listed in `doc/setup_guide.md` — `DATABASE_URL` (or the `DB_*` vars),
+`SECRET_KEY`, `TRUEDATA_USERNAME`/`TRUEDATA_PASSWORD`, WhatsApp/telegram
+tokens, etc.
 
 Caveat: `systemd`'s `EnvironmentFile` is stricter than `python-dotenv` —
 plain `KEY=VALUE` per line, no `export` prefix, and quote any value
 containing spaces or `#`.
 
-Also update in `.env`:
-- `ALLOWED_HOSTS` — add the VM's domain/IP (Django default already includes
-  `.onrender.com`; add your new host).
-- `CORS_ALLOWED_ORIGINS` / `CSRF_TRUSTED_ORIGINS` — should already point at
-  the Vercel frontend URL; no change needed there.
+Also set in `.env`:
+- `ALLOWED_HOSTS` — the VM's domain/IP.
+- `CORS_ALLOWED_ORIGINS` / `CSRF_TRUSTED_ORIGINS` — the frontend's real URL,
+  once you know where it's hosted.
 
 ## 4. Start it
 
@@ -61,26 +61,23 @@ your real domain, then:
 sudo certbot --nginx -d api.yourdomain.com
 ```
 
-If you don't have a domain yet, you can point Vercel at the bare IP over
-HTTP temporarily, but get a domain + TLS before going live — mixed
-content (https frontend → http backend) will be blocked by browsers anyway.
+If you don't have a domain yet, the frontend can hit the bare IP over HTTP
+temporarily, but get a domain + TLS before going live — mixed content
+(https frontend → http backend) will be blocked by browsers anyway.
 
-## 6. Cut over
+## 6. Go live
 
-1. Update the frontend's API base URL env var on Vercel to the new backend
-   URL, redeploy.
+1. Point the frontend's API base URL at this backend's URL, deploy the
+   frontend wherever you've decided to host it.
 2. Confirm signals/market-status/websocket flows work end-to-end against
-   the new backend (see project CLAUDE.md for the signal lifecycle to
+   this backend (see project CLAUDE.md for the signal lifecycle to
    sanity-check).
-3. Once confirmed stable, delete the Render service and remove the
-   cron-job.org keep-alive ping — it's no longer needed since the Oracle VM
-   doesn't sleep.
 
 ## Redeploys going forward
 
 ```bash
 ssh -i your-key.pem ubuntu@<VM_IP>
-./tradepulse-ai/backend/deploy/oracle/redeploy.sh
+./tradepulse-truedata/backend/deploy/oracle/redeploy.sh
 ```
 
 ## APScheduler note
@@ -88,11 +85,9 @@ ssh -i your-key.pem ubuntu@<VM_IP>
 The backend starts `apscheduler` in-process from `AppConfig.ready()`
 (`backend/stocks/apps.py` → `updater.py`), guarded only by `RUN_MAIN` (a
 Django dev-server check) — in production it starts unconditionally in
-**every** gunicorn worker process. Render's `Procfile` (`web: gunicorn
-config.wsgi`) doesn't set `--workers`, so it happened to run as a single
-gunicorn worker, meaning only one scheduler instance was ever running.
+**every** gunicorn worker process.
 
-The systemd unit here matches that with `--workers 1` on purpose — do not
-raise it without first moving the scheduler out of the request-serving
-process, or you'll get duplicate scans and duplicate signals per the stale
-signal guard / signal cap logic described in the project's CLAUDE.md.
+The systemd unit here uses `--workers 1` on purpose — do not raise it
+without first moving the scheduler out of the request-serving process, or
+you'll get duplicate scans and duplicate signals per the stale signal guard /
+signal cap logic described in the project's CLAUDE.md.

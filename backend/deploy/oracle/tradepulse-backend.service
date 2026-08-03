@@ -6,14 +6,14 @@ After=network.target
 Type=simple
 User=ubuntu
 Group=www-data
-WorkingDirectory=/home/ubuntu/tradepulse-ai/backend
-EnvironmentFile=/home/ubuntu/tradepulse-ai/backend/.env
-ExecStartPre=/home/ubuntu/tradepulse-ai/backend/venv/bin/python manage.py migrate --no-input
-ExecStart=/home/ubuntu/tradepulse-ai/backend/venv/bin/gunicorn config.wsgi:application \
+WorkingDirectory=/home/ubuntu/tradepulse-truedata/backend
+EnvironmentFile=/home/ubuntu/tradepulse-truedata/backend/.env
+ExecStartPre=/home/ubuntu/tradepulse-truedata/backend/venv/bin/python manage.py migrate --no-input
+ExecStart=/home/ubuntu/tradepulse-truedata/backend/venv/bin/gunicorn config.wsgi:application \
     --workers 1 \
     --bind unix:/run/tradepulse-backend.sock \
-    --access-logfile /home/ubuntu/tradepulse-ai/backend/logs/gunicorn-access.log \
-    --error-logfile /home/ubuntu/tradepulse-ai/backend/logs/gunicorn-error.log
+    --access-logfile /home/ubuntu/tradepulse-truedata/backend/logs/gunicorn-access.log \
+    --error-logfile /home/ubuntu/tradepulse-truedata/backend/logs/gunicorn-error.log
 Restart=always
 RestartSec=5
 

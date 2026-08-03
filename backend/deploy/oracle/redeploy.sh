@@ -2,7 +2,7 @@
 # Run ON THE VM to pull latest code and restart the backend.
 set -euo pipefail
 
-cd "$HOME/tradepulse-ai"
+cd "$HOME/tradepulse-truedata"
 git pull
 cd backend
 ./venv/bin/pip install -r requirements.txt

@@ -38,7 +38,7 @@ DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 'yes')
 
 ALLOWED_HOSTS = os.getenv(
     'ALLOWED_HOSTS',
-    'localhost,127.0.0.1,tradepulse-ai-udzd.onrender.com,tradepulse-backend-s9ps.onrender.com,.onrender.com',
+    'localhost,127.0.0.1',
 ).split(',')
 
 # ──────────────────────────────────────────────
@@ -101,11 +101,11 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # DATABASE — PostgreSQL
 # ──────────────────────────────────────────────
 # Standard Django DB Config
-# Uses dj-database-url for auto-connection on Render/Heroku via DATABASE_URL environment variable
+# Uses dj-database-url so a single DATABASE_URL env var configures the connection anywhere.
 # `manage.py test` creates/drops a `test_<name>` database on whatever `default` points
-# at. Locally that is the production Supabase instance (see .env) — Django's TEST dict
+# at. If DATABASE_URL is ever pointed at a shared/production DB, Django's TEST dict
 # can rename that database but cannot change its ENGINE, so it would still issue
-# CREATE DATABASE / DROP DATABASE straight at production. Swapping the whole `default`
+# CREATE DATABASE / DROP DATABASE straight at it. Swapping the whole `default`
 # connection to a throwaway local sqlite file whenever the test runner is active is the
 # only way to keep TestCase-based suites (e.g. tests_swing_v2.py) from ever touching prod.
 if 'test' in sys.argv:
@@ -188,7 +188,7 @@ AUTHENTICATION_BACKENDS = [
 # ──────────────────────────────────────────────
 raw_origins = os.getenv(
     'CORS_ALLOWED_ORIGINS',
-    'http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,https://jaydeepdhamecha.github.io,https://tradepulse-ai-udzd.onrender.com,https://tradepulse-ai-mu.vercel.app'
+    'http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173'
 )
 CORS_ALLOWED_ORIGINS = [o.strip().rstrip('/') for o in raw_origins.split(',') if o.strip()]
 
@@ -209,10 +209,7 @@ CORS_ALLOW_METHODS = [
     'PUT',
 ]
 
-CSRF_TRUSTED_ORIGINS = [
-    'https://tradepulse-ai-mu.vercel.app',
-    'https://tradepulse-ai-udzd.onrender.com',
-]
+CSRF_TRUSTED_ORIGINS = os.getenv('CSRF_TRUSTED_ORIGINS', '').split(',') if os.getenv('CSRF_TRUSTED_ORIGINS') else []
 
 # ──────────────────────────────────────────────
 # INTERNATIONALIZATION

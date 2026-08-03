@@ -7,13 +7,13 @@
 #   chmod +x setup.sh && ./setup.sh
 #
 # After it finishes you still need to:
-#   1. Fill in /home/ubuntu/tradepulse-ai/backend/.env (copy from Render's env vars)
+#   1. Fill in /home/ubuntu/tradepulse-truedata/backend/.env (see doc/setup_guide.md)
 #   2. sudo systemctl start tradepulse-backend
 #   3. Point nginx server_name at your domain/IP and run certbot for HTTPS
 set -euo pipefail
 
-REPO_URL="https://github.com/dhamechajaydeep5586-rgb/tradepulse-ai.git"
-APP_DIR="$HOME/tradepulse-ai"
+REPO_URL="https://github.com/dhamechajaydeep5586-rgb/tradepulse-truedata.git"
+APP_DIR="$HOME/tradepulse-truedata"
 
 echo "==> Opening OS-level firewall for HTTP/HTTPS (Oracle images default-deny)"
 sudo iptables -I INPUT -p tcp --dport 80 -j ACCEPT
@@ -41,7 +41,7 @@ python3.13 -m venv venv
 mkdir -p logs
 
 if [ ! -f .env ]; then
-    echo "==> No .env found — copy Render's environment variables into $APP_DIR/backend/.env before starting the service."
+    echo "==> No .env found — create $APP_DIR/backend/.env before starting the service (see doc/setup_guide.md)."
     touch .env
 fi
 
