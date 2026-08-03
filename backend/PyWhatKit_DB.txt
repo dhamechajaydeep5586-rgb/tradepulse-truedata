@@ -1,0 +1,55 @@
+Date: 31/3/2026
+Time: 14:36
+Phone Number: +919978165586
+Message: NEW SIGNAL: NATURAL GASType: BUYEntry: 275.0SL: 272.3Target: 279.1Signal: 08:06 PMStatus: PENDING
+--------------------
+Date: 31/3/2026
+Time: 14:36
+Phone Number: +919978165586
+Message: NEW SIGNAL: NATURAL GASType: BUYEntry: 275.0SL: 272.5Target: 279.3Signal: 08:06 PMStatus: PENDING
+--------------------
+Date: 31/3/2026
+Time: 14:38
+Phone Number: +919978165586
+Message: NEW SIGNAL: NATURAL GASType: BUYEntry: 275.2SL: 272.4Target: 279.4Signal: 08:08 PMStatus: PENDING
+--------------------
+Date: 31/3/2026
+Time: 14:42
+Phone Number: +919978165586
+Message: TEST SIGNAL: NATURAL GASType: BUYEntry: 279.40SL: 276.70Target: 283.40Signal: 08:15 PMStatus: PENDING
+--------------------
+Date: 31/3/2026
+Time: 14:42
+Phone Number: +919978165586
+Message: TEST SIGNAL: NATURAL GASType: BUYEntry: 279.40SL: 276.70Target: 283.40Signal: 08:15 PMStatus: PENDING
+--------------------
+Date: 31/3/2026
+Time: 14:43
+Phone Number: +919978165586
+Message: NEW SIGNAL: NATURAL GASType: BUYEntry: 275.2SL: 272.6Target: 279.4Signal: 08:12 PMStatus: PENDING
+--------------------
+Date: 31/3/2026
+Time: 14:43
+Phone Number: +919978165586
+Message: this is test
+--------------------
+Date: 31/3/2026
+Time: 14:46
+Phone Number: +919978165586
+Message: this is test
+--------------------
+Date: 31/3/2026
+Time: 14:46
+Phone Number: +919978165586
+Message: NEW SIGNAL: NATURAL GASType: BUYEntry: 275.3SL: 272.4Target: 279.4Signal: 08:16 PMStatus: PENDING
+--------------------
+Date: 31/3/2026
+Time: 14:47
+Phone Number: +919978165586
+Message: TEST SIGNAL: NATURAL GASType: BUYEntry: 279.40SL: 276.70Target: 283.40Signal: 08:15 PMStatus: PENDING
+--------------------
+Date: 31/3/2026
+Time: 14:59
+Phone Number: +919978165586
+Message: SIGNAL ACTIVE: NATURAL GASType: BUYEntry: 275.3SL: 272.4Target: 279.4Signal: 08:16 PMActive: 08:17 PMStatus: ACTIVE
+--------------------

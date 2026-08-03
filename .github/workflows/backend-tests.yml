@@ -1,0 +1,89 @@
+name: Backend Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tradepulse_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # `manage.py test` (sys.argv contains "test") makes config/settings.py force
+      # DATABASES onto a throwaway local sqlite file regardless of these values —
+      # see the comment above the DATABASES block in backend/config/settings.py.
+      # The Postgres service container above is provisioned to match production's
+      # real engine; the "Run backend test suite" step below never touches it (sqlite
+      # override), but "Run standalone self-checks" does — those scripts aren't
+      # invoked via `manage.py test`, so they hit this real Postgres via DATABASE_URL
+      # and need it actually migrated first (see the "Migrate database" step).
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: tradepulse_db
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/tradepulse_db
+      SECRET_KEY: ci-test-secret-key
+      DEBUG: "False"
+      # Must match the hardcoded token in stocks/tests.py's cron-trigger tests —
+      # CronScannerTriggerView fails closed (503) with no token set at all, so this
+      # is required for those tests to reach the 200/401 paths they actually assert on.
+      CRON_SECRET_TOKEN: trade_pulse_secure_cron_trigger_2026
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run backend test suite
+        working-directory: backend
+        run: python manage.py test stocks
+
+      - name: Migrate database
+        # Only needed for the self-checks below — `manage.py test` above never
+        # touches this Postgres container (sqlite override), so it's still an
+        # empty schema at this point.
+        working-directory: backend
+        run: python manage.py migrate --noinput
+
+      - name: Run standalone self-checks
+        # These are plain assert-and-sys.exit(1) scripts, not Django TestCases — kept out
+        # of `test*.py` naming on purpose so they can't be silently pulled into Django's
+        # test discovery, where a sys.exit() mid-collection would abort every other test
+        # before it runs (see regime_service.py's docstring for the incident this caused).
+        working-directory: backend
+        env:
+          PYTHONPATH: .
+        run: |
+          set -e
+          for f in stocks/selfcheck_*.py; do
+            echo "=== $f ==="
+            python "$f"
+          done

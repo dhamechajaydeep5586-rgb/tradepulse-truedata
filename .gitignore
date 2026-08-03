@@ -1,0 +1,25 @@
+# Environment
+.env
+venv/
+*.pyc
+__pycache__/
+node_modules/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Database
+*.sqlite3
+db.sqlite3
+
+# Logs
+nohup.out
+logs/
+*.log
+
+# Cache
+backend/django_cache/

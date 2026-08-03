@@ -1,0 +1,43 @@
+{
+  "scanner": {
+    "nifty_500_prefilter_pct": 0.5,
+    "nifty_500_prefilter_volume": 50000,
+    "top_candidates_count": 50,
+    "max_telegram_alerts": 10
+  },
+  "indicators": {
+    "ema_trend_short": 50,
+    "ema_trend_long": 200,
+    "ema_trailing": 20,
+    "adx_period": 14,
+    "rsi_period": 14,
+    "atr_period": 14
+  },
+  "strategy": {
+    "min_ai_score": 25.0,
+    "min_adx_threshold": 25.0,
+    "adx_relaxed_threshold": 15.0,
+    "min_volume_multiplier": 1.5,
+    "volume_relaxed_multiplier": 1.0,
+    "near_52w_high_percent": 5.0,
+    "near_52w_relaxed_percent": 10.0,
+    "minimum_liquidity_floor": 100000,
+    "min_risk_reward_ratio": 2.0
+  },
+  "trade_lifecycle": {
+    "pending_expiry_trading_days": 30,
+    "active_review_calendar_days": 90,
+    "archived_cooldown_trading_days": 20,
+    "atr_stop_loss_multiplier": 2.0,
+    "max_stop_loss_floor_pct": 10.0,
+    "target1_risk_reward": 2.0,
+    "target2_risk_reward": 3.0,
+    "target3_risk_reward": 4.0
+  },
+  "telegram": {
+    "alerts_enabled": true,
+    "async_execution": true,
+    "max_retries": 3,
+    "retry_delay_seconds": 10
+  }
+}
