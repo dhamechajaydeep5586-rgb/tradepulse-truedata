@@ -89,9 +89,11 @@ export default function OptionBuyingTable() {
     return matchesFilter && matchesStatus;
   });
 
-  const fetchData = useCallback(() => {
+  const fetchData = useCallback((force = false) => {
     setError(null);
-    API.get("/api/stocks/option-buying/")
+    if (force) setLoading(true);
+    const url = force ? "/api/stocks/option-buying/?force=true" : "/api/stocks/option-buying/";
+    API.get(url)
       .then((res) => {
         setData(res.data);
         setError(null);
@@ -340,9 +342,18 @@ export default function OptionBuyingTable() {
                 </div>
               )}
               <p className="pt-3 border-t border-gray-800/50 text-[10px] text-gray-500 leading-tight">
-                Read-only — this page always requests current DB state. Generation only happens
-                on the backend's own 15-min scheduler, not from this page.
+                Generation normally only happens on the backend's own 15-min scheduler.
+                Force Scan bypasses that for testing (still subject to market hours, the
+                2:30 PM time-stop, and a rate limit).
               </p>
+              <button
+                onClick={() => fetchData(true)}
+                disabled={loading}
+                className="w-full flex items-center justify-center gap-1.5 rounded-lg bg-gray-800 px-3 py-2 text-xs font-semibold text-gray-300 transition hover:bg-gray-700 hover:text-white disabled:opacity-50"
+                title="Force scan option-buying signals"
+              >
+                <span className={loading ? "animate-spin" : ""}>⚡</span> Force Scan
+              </button>
             </div>
           </div>
 

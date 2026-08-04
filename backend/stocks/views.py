@@ -1,5 +1,6 @@
 from datetime import date, datetime
 
+from django.conf import settings
 from rest_framework import generics
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.views import APIView
@@ -11,9 +12,17 @@ from .serializers import SignalHistorySerializer
 from stocks.services.intraday_service import get_live_signals
 from stocks.services.live_signal_service import get_latest_prices, update_signal_outcomes, get_performance_report
 from stocks.services.signal_utils import IST, is_market_open
-from stocks.services.option_chain_service import get_option_chain
+from stocks.services.option_chain_service import get_option_chain, get_option_chain_db_snapshot
 from stocks.services.fii_dii_service import get_fii_dii_data
 from stocks.services.trading_engine import candles_to_dataframe, get_market_rules, run_backtest_for_signal
+
+# LivePriceUpdateView's server-side symbol cap. The frontend poller already limits
+# itself to ACTIVE/PENDING signals (<=5 symbols, see LiveSignalsTable.jsx), but that
+# was never enforced server-side — see the "403 rate limit errors" / "poller hitting
+# 500+ symbols" entry in CLAUDE.md's Common Bugs history. Generous headroom over every
+# engine's legitimate poll size, far below "hundreds". Same getattr(settings, ...,
+# default) pattern as INTRADAY_ACCOUNT_EQUITY and friends elsewhere in this codebase.
+LIVE_PRICE_MAX_SYMBOLS = int(getattr(settings, "LIVE_PRICE_MAX_SYMBOLS", 20))
 
 
 class LiveSignalView(APIView):
@@ -25,6 +34,15 @@ class LiveSignalView(APIView):
     # it needs a DRF-level cap independent of that cooldown rather than relying on it alone.
     throttle_classes = [UserRateThrottle, AnonRateThrottle, ScopedRateThrottle]
     throttle_scope = 'force_scan'
+
+    def get_throttles(self):
+        # throttle_scope is a class attribute, so ScopedRateThrottle would otherwise cap
+        # EVERY request to this view at force_scan's rate (2/min) — including the plain
+        # 5-min poll that isn't forcing anything. Only apply it to ?force=true requests,
+        # matching the comment above's actual intent.
+        if self.request.query_params.get('force', 'false').lower() == 'true':
+            return [t() for t in self.throttle_classes]
+        return [t() for t in self.throttle_classes if t is not ScopedRateThrottle]
 
     def get(self, request):
         try:
@@ -124,20 +142,10 @@ class OptionChainView(APIView):
                 return Response(cached_data)
             
             # Fallback to the latest saved record in the database
-            from stocks.models import OptionChain
-            latest = OptionChain.objects.filter(symbol=symbol).order_by('-timestamp').first()
-            if latest:
-                return Response({
-                    "symbol": latest.symbol,
-                    "spot_price": float(latest.spot_price),
-                    "pcr": float(latest.pcr),
-                    "max_pain": float(latest.max_pain),
-                    "total_ce_oi": int(latest.total_ce_oi),
-                    "total_pe_oi": int(latest.total_pe_oi),
-                    "timestamp": latest.timestamp.isoformat(),
-                    "chains": latest.chain_data_json if isinstance(latest.chain_data_json, list) else []
-                })
-            
+            snapshot = get_option_chain_db_snapshot(symbol)
+            if snapshot:
+                return Response(snapshot)
+
             return Response({})
 
         data = get_option_chain(symbol)
@@ -161,6 +169,11 @@ class LivePriceUpdateView(APIView):
         if not symbols_str:
             return Response({})
         symbols = [s.strip() for s in symbols_str.split(',') if s.strip()]
+        if len(symbols) > LIVE_PRICE_MAX_SYMBOLS:
+            return Response(
+                {"error": f"Too many symbols requested (max {LIVE_PRICE_MAX_SYMBOLS})."},
+                status=400
+            )
         data = get_latest_prices(symbols)
         return Response(data)
 
@@ -205,27 +218,52 @@ class ProPerformanceReportView(APIView):
 
 
 class DeltaHedgeView(APIView):
-    """GET /api/stocks/delta-hedge/ — Returns option selling hedge suggestions"""
+    """GET /api/stocks/delta-hedge/ — Returns option selling hedge suggestions.
+    ?force=true (Force Scan button) bypasses the 2s cache and lets action auto-resolve
+    instead of hardcoding "update" — same effect as the 10:45 AM cron's own call, just
+    triggered on demand. get_hedge_panel_data's existing today_spec_exists check means
+    this only actually scans if no specialist signal exists yet today; otherwise it's
+    just a fresh "update" read, same as a plain poll."""
     permission_classes = (IsAuthenticated,)
+    throttle_classes = [UserRateThrottle, AnonRateThrottle, ScopedRateThrottle]
+    throttle_scope = 'force_scan'
+
+    def get_throttles(self):
+        # Only cap ?force=true requests at force_scan's rate — same fix as
+        # LiveSignalView/OptionBuyingView.get_throttles(), not every 3s poll.
+        # POST (Reset Strategy) is equally destructive/expensive as a forced scan
+        # — cancels every live signal and immediately rebuilds — so it always gets
+        # the same force_scan scope regardless of query params.
+        if self.request.method == 'POST' or self.request.query_params.get('force', 'false').lower() == 'true':
+            return [t() for t in self.throttle_classes]
+        return [t() for t in self.throttle_classes if t is not ScopedRateThrottle]
 
     def get(self, request):
         from stocks.services.delta_hedge_service import get_hedge_panel_data
         from django.core.cache import cache
 
-        # Cache for 2 seconds (live performance)
+        force = request.query_params.get('force', 'false').lower() == 'true'
+
+        # Cache for 2 seconds (live performance) — skipped on a forced scan so the
+        # button's response reflects the fresh state, not a just-cached stale one.
         cache_key = "delta_hedge_panel_2s"
-        cached = cache.get(cache_key)
-        if cached:
-            return Response(cached)
+        if not force:
+            cached = cache.get(cache_key)
+            if cached:
+                return Response(cached)
 
         try:
-            # action="update" explicitly — a passive page view must never trigger a
-            # fresh "generate" scan (that decision belongs solely to the scheduled
-            # internal job in updater.py / run_periodic_scanners, which calls this
-            # with action=None and lets it auto-decide). Without this, simply opening
-            # the dashboard could silently create new trades and fire Telegram alerts.
-            data = get_hedge_panel_data(action="update")
-            cache.set(cache_key, data, timeout=2)
+            # action="update" explicitly on a plain poll — a passive page view must
+            # never trigger a fresh "generate" scan (that decision belongs solely to
+            # the scheduled internal job in updater.py / run_periodic_scanners, which
+            # calls this with action=None and lets it auto-decide). Force Scan passes
+            # action=None too, so it gets that same auto-decide behavior instead of
+            # always generating. sync_scan runs any resulting scan inline so a forced
+            # call returns the fresh result immediately rather than via background
+            # thread on the next poll.
+            data = get_hedge_panel_data(action=None if force else "update", sync_scan=force)
+            if not force:
+                cache.set(cache_key, data, timeout=2)
             return Response(data)
         except Exception as e:
             from django.utils import timezone
@@ -245,6 +283,15 @@ class DeltaHedgeView(APIView):
         from django.utils import timezone
         import logging
         logger = logging.getLogger('stocks.views')
+
+        # Guest/demo accounts (RegisterView always creates these with is_temporary=True,
+        # see users/views.py) must not have destructive power over the live strangle
+        # book — same is_temporary convention ProfileView already enforces for session
+        # expiry. This blocks the specific disclosed hole without touching
+        # permission_classes, so it can't lock out the real owner account.
+        if getattr(request.user, 'is_temporary', False):
+            logger.warning("[RESET] Blocked temporary account %s from resetting strategy", request.user.pk)
+            return Response({"error": "This action is not available on a temporary account."}, status=403)
 
         today = timezone.now().date()
 
@@ -367,13 +414,25 @@ class DeltaHedgeView(APIView):
 class OptionBuyingView(APIView):
     """GET /api/stocks/option-buying/ — instantly returns DB signals, same pattern as
     LiveSignalView: scanning happens only via run_periodic_scanners()/cron, a passive
-    page view must never trigger a live scan."""
+    page view must never trigger a live scan. ?force=true bypasses that (same
+    force_scan throttle scope as LiveSignalView) and routes through the real engine,
+    which still enforces its own market-hours/time-stop/scan-rate guards."""
     permission_classes = (IsAuthenticated,)
+    throttle_classes = [UserRateThrottle, AnonRateThrottle, ScopedRateThrottle]
+    throttle_scope = 'force_scan'
+
+    def get_throttles(self):
+        # Same fix as LiveSignalView.get_throttles() — only cap ?force=true requests
+        # at force_scan's 2/min rate, not every plain poll (see that view's comment).
+        if self.request.query_params.get('force', 'false').lower() == 'true':
+            return [t() for t in self.throttle_classes]
+        return [t() for t in self.throttle_classes if t is not ScopedRateThrottle]
 
     def get(self, request):
         from stocks.services.option_buying_service import get_option_buying_signals
         try:
-            payload = get_option_buying_signals(action="update")
+            force = request.query_params.get('force', 'false').lower() == 'true'
+            payload = get_option_buying_signals(action="generate" if force else "update")
             return Response(payload)
         except Exception as e:
             from django.utils import timezone

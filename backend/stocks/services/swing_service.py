@@ -35,7 +35,7 @@ from stocks.services.shared import portfolio_risk, ranking, sector as sector_svc
 from stocks.services.shared.regime import get_regime
 from stocks.services.shared.risk_engine import fits_gross_budget, gross_budget
 from stocks.services.shared.universe import get_trading_universe
-from stocks.services.signal_utils import IST, round_to_tick, ta_ema
+from stocks.services.signal_utils import IST, round_to_tick, ta_ema, gap_adjusted_stop_price
 from stocks.services import swing_signals
 
 logger = logging.getLogger(__name__)
@@ -413,7 +413,9 @@ def run_swing_eod_evaluation(profile=SWING) -> dict:
 
         # ── 1. Stop (pessimistic — checked first) ───────────────────────────────
         if low <= stop:
-            _close_position(sig, stop, ShortTermSignal.Status.HIT_SL, "LEVEL_HIT_STOP")
+            # Gap-through: fill at the day's actual low, not the raw stop level.
+            exit_px = gap_adjusted_stop_price(stop, low, is_buy=True)
+            _close_position(sig, exit_px, ShortTermSignal.Status.HIT_SL, "LEVEL_HIT_STOP")
             counts["exited"] += 1
             continue
 

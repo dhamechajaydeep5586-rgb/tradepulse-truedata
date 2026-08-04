@@ -9,9 +9,17 @@ const DeltaHedgePanel = () => {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [resetting, setResetting] = useState(false);
+    const [scanning, setScanning] = useState(false);
     const [showTooltip, setShowTooltip] = useState(null);
     const { permission, requestPermission } = useSignalNotification("delta-hedge");
     const resetPollRef = useRef(null);
+    // Same pattern as OptionBuyingTable.jsx: read market state via a ref updated
+    // on every successful fetch (not a value captured once at effect-mount time),
+    // so a tab left open across the market open/close boundary picks up the
+    // correct cadence on its next tick instead of freezing at whichever cadence
+    // was live when the effect first ran.
+    const isOpenRef = useRef(false);
+    const lastFetchAtRef = useRef(0);
     // Positions default to collapsed (a one-line summary) — with ~9 live positions
     // each rendering a full multi-row contract table, the page required a lot of
     // scrolling to see everything. Expand on demand instead.
@@ -24,12 +32,14 @@ const DeltaHedgePanel = () => {
         });
     };
 
-    const fetchData = useCallback(async (isRefresh = false) => {
+    const fetchData = useCallback(async (isRefresh = false, force = false) => {
         if (!isRefresh) setLoading(true);
         try {
-            const response = await axios.get('/api/stocks/delta-hedge/');
+            const url = force ? '/api/stocks/delta-hedge/?force=true' : '/api/stocks/delta-hedge/';
+            const response = await axios.get(url);
             setData(response.data);
             setError(null);
+            isOpenRef.current = response.data?.market_status === "OPEN";
         } catch (err) {
             setError(err.message);
         } finally {
@@ -37,9 +47,29 @@ const DeltaHedgePanel = () => {
         }
     }, []);
 
+    const handleForceScan = async () => {
+        setScanning(true);
+        try {
+            await fetchData(true, true);
+        } finally {
+            setScanning(false);
+        }
+    };
+
     useEffect(() => {
+        // 3s live refresh while the market is open; drops to a 30-min cadence
+        // when closed, matching OptionBuyingTable's closed-market poll rate.
+        const CHECK_MS = 3000;
+        const CLOSED_POLL_MS = 30 * 60 * 1000;
+        lastFetchAtRef.current = Date.now();
         fetchData();
-        const interval = setInterval(() => fetchData(true), 3000); // Live refresh every 3s
+        const interval = setInterval(() => {
+            const now = Date.now();
+            if (isOpenRef.current || now - lastFetchAtRef.current >= CLOSED_POLL_MS) {
+                lastFetchAtRef.current = now;
+                fetchData(true);
+            }
+        }, CHECK_MS);
         return () => clearInterval(interval);
     }, [fetchData]);
 
@@ -187,6 +217,23 @@ const DeltaHedgePanel = () => {
                                     Reset Strategy
                                 </>
                             )}
+                        </button>
+
+                        {/* Force Scan — generates today's signal on demand if it hasn't run yet
+                            (e.g. the 10:45 AM cron missed it); if one's already generated today
+                            this just re-fetches current state instead of scanning again. */}
+                        <button
+                            onClick={handleForceScan}
+                            disabled={scanning || resetting}
+                            className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border text-[10px] font-black uppercase tracking-widest transition-colors group ${
+                                scanning
+                                    ? 'border-indigo-500/30 bg-indigo-500/5 text-indigo-400 cursor-not-allowed'
+                                    : 'border-emerald-500/30 bg-emerald-500/5 text-emerald-400 hover:bg-emerald-500/10'
+                            }`}
+                            title="Scan now if today's signal hasn't been generated yet"
+                        >
+                            <span className={scanning ? "animate-spin" : ""}>⚡</span>
+                            {scanning ? "Scanning..." : "Force Scan"}
                         </button>
 
                         {data?.trading_window !== undefined && (

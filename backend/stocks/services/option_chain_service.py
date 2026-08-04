@@ -244,6 +244,33 @@ def _top_buildup(records: list[dict], side: str, n: int = 5) -> list[dict]:
 # Public API
 # ---------------------------------------------------------------------------
 
+def get_option_chain_db_snapshot(symbol: str) -> dict[str, Any] | None:
+    """
+    Return the most recently stored real OptionChain snapshot for *symbol*,
+    shaped like the live/mock response dict, or None if nothing is stored yet.
+
+    Shared by get_option_chain()'s failure fallback and OptionChainView's
+    market-closed fallback so there's a single query for "latest real snapshot".
+    """
+    from stocks.models import OptionChain
+
+    latest = OptionChain.objects.filter(symbol=symbol).order_by('-timestamp').first()
+    if not latest:
+        return None
+
+    return {
+        "symbol": latest.symbol,
+        "spot_price": float(latest.spot_price),
+        "pcr": float(latest.pcr),
+        "max_pain": float(latest.max_pain),
+        "total_ce_oi": int(latest.total_ce_oi),
+        "total_pe_oi": int(latest.total_pe_oi),
+        "chain": latest.chain_data_json if isinstance(latest.chain_data_json, list) else [],
+        "timestamp": latest.timestamp.isoformat(),
+        "is_mock": False,
+    }
+
+
 def _save_option_chain_snapshot(data: dict[str, Any]):
     """Save a snapshot of the option chain to the database for fallback use."""
     try:
@@ -295,8 +322,11 @@ def get_option_chain(symbol: str = "NIFTY") -> dict[str, Any]:
         records = _extract_records(records_raw)
 
         if not records:
-            logger.warning("No option chain records for %s — using mock.", symbol)
-            result = _generate_mock_chain(symbol)
+            logger.warning("No option chain records for %s — falling back.", symbol)
+            result = get_option_chain_db_snapshot(symbol)
+            if result is None:
+                result = _generate_mock_chain(symbol)
+                result["is_mock"] = True
         else:
             pcr = _compute_pcr(records)
             max_pain = _compute_max_pain(records)
@@ -318,13 +348,17 @@ def get_option_chain(symbol: str = "NIFTY") -> dict[str, Any]:
                 "total_pe_oi": total_pe_oi,
                 "ce_buildup": ce_buildup,
                 "pe_buildup": pe_buildup,
+                "is_mock": False,
             }
-            
+
             # Save valid real data to database
             _save_option_chain_snapshot(result)
 
     except Exception as exc:
         logger.error("NSE option-chain request or parse failed for %s: %s", symbol, exc)
-        result = _generate_mock_chain(symbol)
-        
+        result = get_option_chain_db_snapshot(symbol)
+        if result is None:
+            result = _generate_mock_chain(symbol)
+            result["is_mock"] = True
+
     return result

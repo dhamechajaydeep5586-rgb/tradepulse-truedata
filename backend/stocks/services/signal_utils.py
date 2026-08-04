@@ -268,6 +268,20 @@ def round_to_tick(val: float, tick: float = 0.05) -> float:
     if pd.isna(val): return 0.0
     return round(round(val / tick) * tick, 2)
 
+def gap_adjusted_stop_price(stop: float, touched_extreme: float, is_buy: bool) -> float:
+    """Recorded stop-exit price for a bar that crossed the stop.
+
+    A bar merely grazing the stop fills close to the stop level; a genuine gap-through
+    (news, illiquid stock, circuit-triggered reopen) can leave the bar's low/high well
+    past it, and booking the stop level in that case understates the real loss. 0.05%
+    tolerance distinguishes an ordinary graze (recorded at the stop, as before) from a
+    real gap (recorded at the actual touched extreme) — wide enough to ignore tick/float
+    noise, tight enough to catch a real gap.
+    """
+    tol = stop * 0.0005
+    breach = (stop - touched_extreme) if is_buy else (touched_extreme - stop)
+    return touched_extreme if breach > tol else stop
+
 def compute_atr(df: pd.DataFrame, period: int) -> float:
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)

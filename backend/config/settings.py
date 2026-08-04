@@ -22,19 +22,45 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # gunicorn worker restart — the default LocMemCache is per-process and goes
 # cold every time a worker is killed/re-spawned, forcing an immediate re-hit
 # of slow/rate-limited third-party APIs (NSE).
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
-        "LOCATION": os.getenv("DJANGO_CACHE_DIR", str(BASE_DIR / "django_cache")),
+# Tests get an isolated in-memory cache instead (same 'test' in sys.argv
+# technique as DATABASES below) — otherwise a test run reads/writes the same
+# on-disk cache directory as a real dev/prod process, so results can depend on
+# stale market data left over from an actual run.
+if 'test' in sys.argv:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        }
     }
-}
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
+            "LOCATION": os.getenv("DJANGO_CACHE_DIR", str(BASE_DIR / "django_cache")),
+        }
+    }
 
 # ──────────────────────────────────────────────
 # SECURITY
 # ──────────────────────────────────────────────
-SECRET_KEY = os.getenv('SECRET_KEY', 'change-me-in-production')
-
 DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 'yes')
+
+# No hardcoded fallback in production (same fail-closed pattern as
+# CRON_SECRET_TOKEN in stocks/views.py): a source-committed default here would
+# let anyone who has seen this repo forge session/CSRF/JWT tokens (SIMPLE_JWT
+# below has no explicit SIGNING_KEY, so it signs with SECRET_KEY too) for any
+# missing-env-var deploy mistake. Dev/test keep the fallback so local runs and
+# CI without SECRET_KEY set don't break.
+if os.getenv('SECRET_KEY'):
+    SECRET_KEY = os.environ['SECRET_KEY']
+elif DEBUG or 'test' in sys.argv:
+    SECRET_KEY = 'change-me-in-production'
+else:
+    raise RuntimeError(
+        "SECRET_KEY environment variable is not set. Refusing to start with a "
+        "known, source-committed fallback in production — see CRON_SECRET_TOKEN "
+        "in stocks/views.py for the same fail-closed pattern applied elsewhere."
+    )
 
 ALLOWED_HOSTS = os.getenv(
     'ALLOWED_HOSTS',
@@ -56,6 +82,7 @@ INSTALLED_APPS = [
     # Third-party
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
 
     # Local apps

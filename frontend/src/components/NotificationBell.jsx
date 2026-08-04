@@ -1,16 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
 import API from '../api/axios';
-import { useAuth } from '../context/AuthContext';
 
 export default function NotificationBell() {
-  const { authTokens } = useAuth();
   const [isOpen, setIsOpen] = useState(false);
   const [notifications, setNotifications] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const dropdownRef = useRef(null);
 
   const fetchNotifications = async () => {
-    if (!authTokens) return;
     try {
       const response = await API.get('/api/stocks/notifications/');
       setNotifications(response.data.notifications || []);
@@ -35,7 +32,7 @@ export default function NotificationBell() {
       clearInterval(interval);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [authTokens]);
+  }, []);
 
   // Click outside to close
   useEffect(() => {

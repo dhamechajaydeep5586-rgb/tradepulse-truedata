@@ -95,6 +95,45 @@ class UpdateSignalOutcomesTests(TestCase):
         self.assertEqual(float(signal.exit_price), 1209.40)
         self.assertEqual(signal.exit_time, test_now)
 
+    @patch("stocks.services.truedata_service.get_truedata_instance")
+    @patch("stocks.services.live_signal_service.get_latest_prices")
+    def test_intraday_stop_gap_through_records_bar_low_not_raw_stop(
+        self, mock_get_prices, mock_get_svc,
+    ):
+        """Audit fix: a genuine gap-through (bar low well past the stop, e.g. a news
+        gap / illiquid reopen) must book the bar's actual touched low as exit_price,
+        not the optimistic raw stop level — this exit price feeds the daily-loss-limit
+        kill switch's realised P&L sum (_enforce_daily_loss_limit), so understating the
+        loss here is exactly the scenario the kill switch most needs to catch."""
+        import pandas as pd
+
+        signal = self._create_signal(status=SignalHistory.Status.ACTIVE, category="intraday")
+        test_now = datetime(2026, 4, 1, 10, 30, tzinfo=IST)
+        MockDatetime._mock_now = test_now
+        mock_get_prices.return_value = {"CDSL": 1150.0}
+
+        # stop_loss=1174.90 (see _create_signal). Bar low gaps well past it — far
+        # beyond the 0.05% graze tolerance in gap_adjusted_stop_price.
+        gapped_low = 1150.0
+        bars = pd.DataFrame(
+            {"Open": [1180.0], "High": [1180.0], "Low": [gapped_low],
+             "Close": [1155.0], "Volume": [10000]},
+            index=pd.DatetimeIndex([datetime(2026, 4, 1, 10, 0)]),  # naive -> localized to IST
+        )
+
+        mock_svc = MagicMock()
+        mock_svc.get_token_map.return_value = {"CDSL": "CDSL"}
+        mock_svc.get_candle_data.return_value = bars
+        mock_get_svc.return_value = mock_svc
+
+        with patch("stocks.services.live_signal_service.dj_timezone.now", return_value=test_now):
+            update_signal_outcomes(force=True)
+
+        signal.refresh_from_db()
+        self.assertEqual(signal.status, SignalHistory.Status.HIT_SL)
+        self.assertAlmostEqual(float(signal.exit_price), gapped_low, delta=0.06)
+        self.assertNotEqual(float(signal.exit_price), 1174.90)  # not the raw stop level
+
     @patch("stocks.services.live_signal_service.get_latest_prices")
     def test_intraday_pending_signal_cancelled_at_cutoff(
         self,
@@ -999,4 +1038,76 @@ class ResolveTargetExpiryTests(TestCase):
         from stocks.services.delta_hedge_service import resolve_target_expiry
 
         self.assertIsNone(resolve_target_expiry([], min_days=3))
+
+
+class OptionChainFallbackTests(TestCase):
+    """
+    Regression test: on an NSE scrape failure, get_option_chain() must prefer the
+    last real stored OptionChain snapshot over fabricated mock data, and must only
+    ever return mock data flagged with is_mock=True (never silently as if live).
+    """
+
+    def _make_snapshot(self, symbol="NIFTY", spot_price=24777):
+        from stocks.models import OptionChain
+        return OptionChain.objects.create(
+            symbol=symbol,
+            spot_price=spot_price,
+            pcr=1.1,
+            max_pain=24500,
+            total_ce_oi=1000000,
+            total_pe_oi=1100000,
+            chain_data_json=[{"strike": 24500, "ce_oi": 1000, "pe_oi": 1000}],
+        )
+
+    def test_live_failure_with_snapshot_returns_real_data_not_mock(self):
+        from unittest.mock import MagicMock
+        from stocks.services.option_chain_service import get_option_chain
+
+        self._make_snapshot(symbol="NIFTY", spot_price=24777)
+
+        fake_session = MagicMock()
+        fake_session.get.side_effect = Exception("network down")
+
+        with patch("stocks.services.option_chain_service._build_session", return_value=fake_session):
+            result = get_option_chain("NIFTY")
+
+        self.assertEqual(float(result.get("spot_price")), 24777.0)
+        self.assertFalse(result.get("is_mock"))
+
+    def test_live_failure_without_snapshot_returns_flagged_mock(self):
+        from unittest.mock import MagicMock
+        from stocks.services.option_chain_service import get_option_chain
+
+        fake_session = MagicMock()
+        fake_session.get.side_effect = Exception("network down")
+
+        with patch("stocks.services.option_chain_service._build_session", return_value=fake_session):
+            result = get_option_chain("NIFTY")
+
+        self.assertTrue(result.get("is_mock"))
+        self.assertEqual(result.get("symbol"), "NIFTY")
+
+    def test_live_success_returns_real_data_without_mock_flag(self):
+        from unittest.mock import MagicMock
+        from stocks.services.option_chain_service import get_option_chain
+
+        fake_resp = MagicMock()
+        fake_resp.raise_for_status.return_value = None
+        fake_resp.json.return_value = {
+            "filtered": {"data": [{
+                "strikePrice": 24500,
+                "CE": {"openInterest": 1000, "changeinOpenInterest": 10, "lastPrice": 50, "totalTradedVolume": 5},
+                "PE": {"openInterest": 900, "changeinOpenInterest": 5, "lastPrice": 40, "totalTradedVolume": 4},
+            }]},
+            "records": {"expiryDates": ["27-Aug-2026"], "underlyingValue": 24500},
+        }
+        fake_session = MagicMock()
+        fake_session.get.return_value = fake_resp
+
+        with patch("stocks.services.option_chain_service._build_session", return_value=fake_session), \
+             patch("stocks.services.option_chain_service._save_option_chain_snapshot"):
+            result = get_option_chain("NIFTY")
+
+        self.assertFalse(result.get("is_mock"))
+        self.assertEqual(result.get("spot_price"), 24500)
 

@@ -12,11 +12,14 @@ discipline that the whole V2 design rests on.
 """
 from __future__ import annotations
 
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
 import numpy as np
 import pandas as pd
 from django.test import TestCase
 
-from stocks.models import PromoterGroup
+from stocks.models import PromoterGroup, ShortTermSignal
 from stocks.services.shared import (
     INTRADAY, LONG_TERM, SWING, TOTAL_ACCOUNT_EQUITY, allocated_equity, get_profile,
 )
@@ -29,7 +32,7 @@ from stocks.services.shared.risk_engine import (
 from stocks.services.trading_engine.cost_model import (
     DEFAULT_COST_MODEL, DELIVERY_COST_MODEL, cost_model_for,
 )
-from stocks.services import swing_signals
+from stocks.services import swing_service, swing_signals
 
 
 def ok(msg, detail=""):
@@ -415,6 +418,39 @@ class SwingV2Tests(TestCase):
         assert SWING.long_only is True
         assert LONG_TERM.long_only is True
         ok("long_only correctly declared per profile")
+
+    # ── 13. EOD gap-through stop fill (audit fix) ──────────────────────────────
+    def test_eod_stop_gap_through_records_bar_low_not_raw_stop(self):
+        print("\n" + "=" * 72 + "\n13. EOD GAP-THROUGH STOP FILL\n" + "=" * 72)
+
+        sig = ShortTermSignal.objects.create(
+            symbol="TESTGAP", entry_price=Decimal("100.00"), stop_loss=Decimal("95.00"),
+            target=Decimal("115.00"), qty=10, status=ShortTermSignal.Status.ACTIVE,
+        )
+
+        # Daily bar gaps well below the 95.00 stop (news / illiquid reopen) — far past
+        # the 0.05% graze tolerance in gap_adjusted_stop_price.
+        gapped_low = 80.0
+        df = _synthetic_uptrend(30, start=100.0)
+        df.iloc[-1, df.columns.get_loc("Low")] = gapped_low
+        df.iloc[-1, df.columns.get_loc("High")] = 96.0
+        df.iloc[-1, df.columns.get_loc("Close")] = 82.0
+
+        mock_svc = MagicMock()
+        mock_svc.get_token_map.return_value = {"TESTGAP": "TESTGAP"}
+
+        with patch("stocks.services.truedata_service.get_truedata_instance", return_value=mock_svc), \
+             patch("stocks.services.candle_store.get_candles", return_value=df):
+            swing_service.run_swing_eod_evaluation(profile=SWING)
+
+        sig.refresh_from_db()
+        assert sig.status == ShortTermSignal.Status.ARCHIVED
+        assert sig.exit_reason == "LEVEL_HIT_STOP"
+        assert abs(float(sig.exit_price) - gapped_low) < 0.06, (
+            f"expected gapped low ~{gapped_low}, got {sig.exit_price}"
+        )
+        ok("gap-through stop books the bar's actual low, not the raw 95.00 stop",
+           f"exit_price={sig.exit_price}")
 
     def test_regime_gating(self):
         print("\n" + "=" * 72 + "\n11. REGIME GATING\n" + "=" * 72)

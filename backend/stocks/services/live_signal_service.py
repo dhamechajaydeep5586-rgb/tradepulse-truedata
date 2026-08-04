@@ -13,7 +13,7 @@ from django.utils import timezone as dj_timezone
 from stocks.models import SignalHistory, Notification, SignalChangeLog
 from stocks.services.signal_utils import (
     IST, MARKET_OPEN, MARKET_CLOSE, INTRADAY_SIGNAL_CUTOFF,
-    is_market_open, round_to_tick
+    is_market_open, round_to_tick, gap_adjusted_stop_price
 )
 
 # Import specialty services
@@ -194,12 +194,14 @@ def _scan_bars_for_exit(sig, bars):
         high, low = float(bar["High"]), float(bar["Low"])
         if is_buy:
             if low <= sl:
-                return SignalHistory.Status.HIT_SL, sl, ts
+                # Gap-through: fill at the bar's actual low, not the raw stop level.
+                return SignalHistory.Status.HIT_SL, gap_adjusted_stop_price(sl, low, is_buy), ts
             if high >= target:
                 return SignalHistory.Status.HIT_TARGET, target, ts
         else:
             if high >= sl:
-                return SignalHistory.Status.HIT_SL, sl, ts
+                # Gap-through: fill at the bar's actual high, not the raw stop level.
+                return SignalHistory.Status.HIT_SL, gap_adjusted_stop_price(sl, high, is_buy), ts
             if low <= target:
                 return SignalHistory.Status.HIT_TARGET, target, ts
     return None
