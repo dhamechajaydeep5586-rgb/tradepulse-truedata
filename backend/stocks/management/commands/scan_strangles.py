@@ -1,6 +1,10 @@
 """
 Management command: scan_strangles
 
+EXPERIMENTAL (audit finding M8) — see short_strangle_scanner.py's module
+docstring. Not wired to the scheduler; independently-parameterized from the
+real, scheduled strangle-selling engine (delta_hedge_service.py).
+
 Runs the intraday short strangle scanner and prints a rich terminal report.
 Does NOT modify the database or send Telegram alerts — pure terminal output.
 

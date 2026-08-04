@@ -25,7 +25,9 @@ chmod +x setup.sh && ./setup.sh
 
 This installs Python 3.13, nginx, certbot, clones the repo, creates the
 venv, and installs (but does not start) the `tradepulse-backend` systemd
-service and nginx site.
+service, nginx site, and a logrotate config for the gunicorn logs (daily,
+14-day retention, compressed — without this a long-running host can
+eventually fill its disk purely from log growth).
 
 ## 3. Environment variables
 

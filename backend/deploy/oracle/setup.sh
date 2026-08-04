@@ -57,6 +57,12 @@ sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t
 sudo systemctl reload nginx
 
+# Audit fix M23: gunicorn writes access/error logs to plain files with no rotation
+# anywhere in this deploy — a long-running, always-on process on a small-disk Oracle
+# Free Tier VM can eventually fill the disk purely from log growth.
+echo "==> Installing logrotate config"
+sudo cp deploy/oracle/logrotate.conf /etc/logrotate.d/tradepulse-backend
+
 echo "==> Done."
 echo "Next: fill in .env, then: sudo systemctl start tradepulse-backend"
 echo "Check status with: sudo systemctl status tradepulse-backend"

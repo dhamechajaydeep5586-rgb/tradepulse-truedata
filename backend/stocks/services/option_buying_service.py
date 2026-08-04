@@ -140,7 +140,16 @@ def select_option_buying_strike(symbol: str, spot: float, direction: str, svc) -
     expiry_str = quote.get("expiry")
     try:
         expiry_dt = datetime.strptime(expiry_str, "%d%b%Y")
-        t_days = max(1, (expiry_dt.date() - datetime.now().date()).days)
+        # Audit fix M12: was naive datetime.now() (server-local/UTC, not IST) with
+        # max(1, ...) silently flooring a genuinely same-day expiry up to "1 day left"
+        # — buying a 0-DTE contract has extreme gamma/theta risk the platform never
+        # explicitly guards against beyond the incidental 0.40-0.60 delta band.
+        today_ist = datetime.now(tz=IST).date()
+        if expiry_dt.date() <= today_ist:
+            logger.info("[OPTION_BUYING][REJECT] %s expiry %s is today or already past — skipping same-day-expiry buy.",
+                        symbol, expiry_str)
+            return None
+        t_days = (expiry_dt.date() - today_ist).days
     except (TypeError, ValueError):
         t_days = 7
 
@@ -294,6 +303,21 @@ def update_option_buying_outcomes() -> None:
     option-selling ("specialist") from the shared update_signal_outcomes() and
     self-auditing instead — option-buying's premium-space math and hard time-stop
     don't fit that shared function's equity/commodity-oriented branches.
+
+    Audit finding M13 (assessed, deliberately deferred): this checks a single live
+    LTP snapshot per ~15-min run_periodic_scanners cycle, with no intrabar/bar-history
+    lookback — unlike the equity engine's _audit_intraday_signal(), which re-scans
+    1-min bar highs/lows since the last checkpoint. A target/SL touch that occurs and
+    reverts between two 15-min polls is invisible here, understating realized wins on
+    the platform's most volatile instrument. Two real fixes exist: (a) adopt the same
+    bar-rescan pattern using per-strike OPTION historical bars, or (b) poll this
+    specific audit more frequently, decoupled from the shared 15-min cadence. Left
+    unimplemented in this pass because (a) needs verification against TrueData's
+    per-strike option bar endpoint, which this codebase's own docs flag as UNVERIFIED
+    against a live account, and (b) means adding a new scheduled job whose REST-call
+    volume/rate-limit impact needs real verification — neither is safe to ship
+    unverified. Revisit with live TrueData access to confirm the option-bar endpoint
+    shape before implementing (a).
     """
     from stocks.services.truedata_service import get_truedata_instance
 
@@ -408,21 +432,31 @@ def get_option_buying_signals(action: str | None = None) -> dict[str, Any]:
     if now_ist.time() < OPTION_BUYING_GENERATION_START:
         return _live_option_buying_payload()
 
-    # Once-per-day generation cap (added 2026-07-29, same reasoning/pattern as
-    # intraday_service.get_live_signals() — see that function's comment for the
-    # rate-limit rationale). Gates on whether a generation ATTEMPT happened today,
-    # not whether one succeeded, so a day with zero qualifying candidates doesn't
-    # keep re-scanning the F&O universe every 15 min. Explicit action="generate"
-    # (Force Scan) still bypasses this.
+    # Bounded-retry generation cap (added 2026-07-29 as a one-shot-per-day gate;
+    # audit fix M10 relaxed it to a bounded retry — see intraday_service.py's
+    # get_live_signals() for the full rationale, mirrored here). Gates on whether
+    # generation has been attempted enough times today AND whether anything from
+    # today already exists, not on a single boolean "was it ever tried" flag — a
+    # day with zero qualifying candidates on the first attempt now gets a few more
+    # tries through the session instead of going silent until tomorrow. Explicit
+    # action="generate" (Force Scan) still bypasses this.
     today_key = now_ist.date().isoformat()
-    generation_attempted_key = f"option_buying_generation_attempted_{today_key}"
-    generation_already_attempted = cache.get(generation_attempted_key, False)
+    generation_attempted_key = f"option_buying_generation_attempts_{today_key}"
+    MAX_GENERATION_ATTEMPTS_PER_DAY = int(getattr(settings, "OPTION_BUYING_MAX_GENERATION_ATTEMPTS", 4))
+    attempts_so_far = cache.get(generation_attempted_key, 0)
+    is_first_attempt_today = attempts_so_far == 0
+    today_has_any_signal = SignalHistory.objects.filter(
+        category=CATEGORY, generated_at__date=now_ist.date(),
+    ).exists()
+    generation_already_attempted = (
+        today_has_any_signal or attempts_so_far >= MAX_GENERATION_ATTEMPTS_PER_DAY
+    )
     resolved_action = action or ("update" if generation_already_attempted else "generate")
 
     if resolved_action == "update":
         return _live_option_buying_payload()
 
-    cache.set(generation_attempted_key, True, timeout=12 * 3600)
+    cache.set(generation_attempted_key, attempts_so_far + 1, timeout=12 * 3600)
 
     # ── Stale Signal Guard ── cancel PENDING/ACTIVE option_buying rows from previous days.
     stale_cancelled = SignalHistory.objects.filter(
@@ -554,9 +588,10 @@ def get_option_buying_signals(action: str | None = None) -> dict[str, Any]:
             send_option_buying_new_signals(newly_created)
         except Exception as tg_err:
             logger.error("[TELEGRAM] Option-buying new-signal alert failed: %s", tg_err)
-    elif not generation_already_attempted:
-        # Day's first (now only) generation attempt found nothing — say so once
-        # rather than leaving silence to be interpreted as a bug.
+    elif is_first_attempt_today:
+        # Only the day's FIRST generation attempt found nothing gets a Telegram
+        # notice — with bounded retries (M10) now possible, later retry attempts
+        # finding nothing too must not resend the same "no setup" message.
         try:
             from stocks.services.telegram_service import send_no_setup_today
             send_no_setup_today("OPTION BUYING", "OPTION_BUYING_NO_SETUP")

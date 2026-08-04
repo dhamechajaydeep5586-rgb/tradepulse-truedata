@@ -43,30 +43,28 @@ export default function OptionChainTable() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const hasChainRef = useRef(false);
-
-  const isMarketOpen = () => {
-    const now = new Date();
-    const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30
-    const istTime = new Date(now.getTime() + istOffset);
-    const day = istTime.getUTCDay(); // 0=Sun, 1=Mon, ..., 6=Sat
-    if (day === 0 || day === 6) return false; // Weekend
-    const hours = istTime.getUTCHours();
-    const minutes = istTime.getUTCMinutes();
-    const totalMinutes = hours * 60 + minutes;
-    const openMinutes = 9 * 60 + 15; // 9:15
-    const closeMinutes = 15 * 60 + 30; // 15:30
-    return totalMinutes >= openMinutes && totalMinutes <= closeMinutes;
-  };
+  // Audit fix M20: trust the backend's NSE-API-backed market_status (see
+  // OptionChainView) instead of a local clock-only check — that check had no
+  // concept of NSE holidays, so a holiday within trading hours still polled
+  // every second, and it duplicated logic the backend already gets right.
+  // Updated on every successful fetch, read from the poller between fetches.
+  const isOpenRef = useRef(false);
 
   useEffect(() => {
     let isSubscribed = true;
-    
+    // Audit fix M17: no request-sequence guard existed on this 1s poller — an
+    // out-of-order response under variable latency could overwrite fresher state
+    // with stale data. requestSeq increments per issued request; a response only
+    // applies if it's still the latest one.
+    let requestSeq = 0;
+
     const fetchChain = (showLoading = false) => {
       if (showLoading) setLoading(true);
       setError(null);
+      const mySeq = ++requestSeq;
       API.get("/api/stocks/option-chain/", { params: { symbol } })
         .then((r) => {
-          if (!isSubscribed) return;
+          if (!isSubscribed || mySeq !== requestSeq) return;
           if (r.data.error) {
             setError(r.data.error);
             setData(r.data);
@@ -74,9 +72,10 @@ export default function OptionChainTable() {
             setData(r.data);
           }
           hasChainRef.current = !!(r.data?.chain?.length > 0);
+          isOpenRef.current = r.data?.market_status === "OPEN";
         })
         .catch((err) => {
-          if (!isSubscribed) return;
+          if (!isSubscribed || mySeq !== requestSeq) return;
           setError(
              err?.response?.data?.detail ?? "Failed to load option chain data."
           );
@@ -91,7 +90,7 @@ export default function OptionChainTable() {
 
     // High frequency 1-second auto-poll only if market is open and data is available
     const pollerId = setInterval(() => {
-      if (isMarketOpen() && hasChainRef.current) {
+      if (isOpenRef.current && hasChainRef.current) {
         fetchChain(false);
       }
     }, 1000);

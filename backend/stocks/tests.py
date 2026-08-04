@@ -1075,6 +1075,68 @@ class SpecialistPortfolioConstraintTests(TestCase):
             mock_build.assert_not_called()
 
 
+class StaleQuoteSuspectTests(TestCase):
+    """
+    Audit fix M6: process_legs() only checked "is the LTP non-zero" — on a
+    circuit-frozen underlying, a stale last-print looks like a live, actionable
+    price to the exit/rebalance logic. Now flags a leg `is_theoretical` (already
+    respected by the exit-check logic elsewhere) once its LTP is frozen across 3
+    consecutive polls while the underlying spot has moved meaningfully.
+    """
+
+    def _leg(self):
+        return {
+            'symbol': 'MOCK', 'option_type': 'CE', 'strike': 25000.0,
+            'expiry': '25JUN2026', 'status': 'WAITING', 'exchange': 'NSE',
+            'action': 'SELL', 'lots': -1, 'lot_size': 50, 'live_iv': 0.20,
+            'sell_price': 12.0, 'cmp': 12.0, 'original_sell_price': 12.0,
+        }
+
+    def test_frozen_ltp_with_moving_spot_flags_theoretical_after_three_polls(self):
+        from stocks.services.delta_hedge_service import process_legs
+
+        leg = self._leg()
+        section = {'underlying': 'MOCK', 'legs': [], 'section_pnl': 0}
+        panel_data = {'total_pnl': 0, 'sections': []}
+
+        frozen_quote = {'NSE:token1': {'ltp': 12.0}}
+        leg['token'] = 'token1'
+
+        # 4 polls -> 3 consecutive same-cmp comparisons (the 1st poll only
+        # establishes the baseline, nothing to compare yet).
+        spots = [24500.0, 24600.0, 24700.0, 24800.0]  # each move >0.1% vs the previous
+        result = [leg]
+        for i, spot in enumerate(spots):
+            result = process_legs(
+                section, result, orch=MagicMock(), panel_data=panel_data,
+                persist_updates=False, bulk_quotes=frozen_quote, underlying_spot=spot,
+            )
+            section['legs'] = []  # reset the "already closed" accumulation path between calls
+
+        self.assertTrue(result[0].get('is_theoretical'),
+                         "A frozen LTP across 3 polls with a moving spot must be flagged suspect")
+
+    def test_moving_ltp_never_flagged(self):
+        """Sanity check: a genuinely live (moving) quote must not be flagged."""
+        from stocks.services.delta_hedge_service import process_legs
+
+        leg = self._leg()
+        leg['token'] = 'token1'
+        section = {'underlying': 'MOCK', 'legs': [], 'section_pnl': 0}
+        panel_data = {'total_pnl': 0, 'sections': []}
+
+        result = [leg]
+        for i, (spot, ltp) in enumerate([(24500.0, 12.0), (24600.0, 12.5), (24700.0, 13.0)]):
+            result = process_legs(
+                section, result, orch=MagicMock(), panel_data=panel_data,
+                persist_updates=False, bulk_quotes={'NSE:token1': {'ltp': ltp}},
+                underlying_spot=spot,
+            )
+            section['legs'] = []
+
+        self.assertFalse(result[0].get('is_theoretical', False))
+
+
 class StrangleRollCapTests(TestCase):
     """
     Audit fix H2: rebalance_delta_neutral_strangle() had no counter/cooldown — the
@@ -1335,6 +1397,53 @@ class ResetStrategyAtomicityTests(TestCase):
         self.assertEqual(response.status_code, 403)
 
 
+class OptionBuyingSameDayExpiryTests(TestCase):
+    """
+    Audit fix M12: select_option_buying_strike() used naive (non-IST) datetime.now()
+    with max(1, ...) silently flooring a genuinely same-day expiry up to "1 day
+    left" — a 0-DTE contract has extreme gamma/theta risk never explicitly guarded
+    against. Now rejects same-day (or already-past) expiry outright.
+    """
+
+    def test_same_day_expiry_is_rejected(self):
+        from stocks.services.option_buying_service import select_option_buying_strike
+
+        today_ist = datetime(2026, 6, 25, 11, 0, tzinfo=IST)
+        mock_svc = MagicMock()
+        mock_svc.get_nearest_strike.return_value = 1500.0
+        mock_svc.get_option_quote.return_value = {
+            "ltp": 20.0, "expiry": "25JUN2026", "trading_symbol": "TESTSTOCK25JUN1500CE",
+        }
+
+        with patch("stocks.services.option_buying_service.datetime") as mock_dt:
+            mock_dt.now.return_value = today_ist
+            mock_dt.strptime = datetime.strptime  # keep real parsing for the expiry string
+            result = select_option_buying_strike("TESTSTOCK", 1490.0, "BUY_CE", mock_svc)
+
+        self.assertIsNone(result, "A same-day-expiry contract must be rejected, not floored to t_days=1")
+
+    def test_future_expiry_still_accepted(self):
+        """Sanity check: the fix must not break the normal multi-day-expiry path."""
+        from stocks.services.option_buying_service import select_option_buying_strike
+
+        today_ist = datetime(2026, 6, 20, 11, 0, tzinfo=IST)
+        mock_svc = MagicMock()
+        mock_svc.get_nearest_strike.return_value = 1500.0
+        mock_svc.get_option_quote.return_value = {
+            "ltp": 20.0, "expiry": "25JUN2026", "trading_symbol": "TESTSTOCK25JUN1500CE",
+        }
+
+        with patch("stocks.services.option_buying_service.datetime") as mock_dt, \
+             patch("stocks.services.option_buying_service.estimate_iv", return_value=0.20), \
+             patch("stocks.services.option_buying_service.calculate_greeks", return_value={"delta": 0.50, "theta": -1.0}):
+            mock_dt.now.return_value = today_ist
+            mock_dt.strptime = datetime.strptime
+            result = select_option_buying_strike("TESTSTOCK", 1490.0, "BUY_CE", mock_svc)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["t_days"], 5)
+
+
 class LotSizeFallbackTests(TestCase):
     """
     Audit fix H18: a failed lot-size lookup used to silently substitute 1 share
@@ -1448,6 +1557,51 @@ class AssignmentRiskFlagTests(TestCase):
 
         self.assertTrue(len(res) >= 2)
         self.assertTrue(all(leg.get('instrument_type') == 'OPTSTK' for leg in res))
+
+
+class IntradayRRRecomputeAfterSlippageTests(TestCase):
+    """
+    Audit fix M11: rr was computed against the pre-slippage entry and never
+    recomputed after the slippage-adjusted fill was applied — a candidate that
+    narrowly cleared the 1.5 RR gate pre-slippage could be persisted with a real
+    RR below the platform's own stated minimum.
+    """
+
+    def test_candidate_rejected_when_slippage_drops_rr_below_threshold(self):
+        from stocks.services.intraday_service import _build_intraday_candidate
+
+        # entry=100, stop=95 (risk=5), target=107.5 -> pre-slippage RR = 7.5/5 = 1.5
+        # (exactly at the gate). An adverse BUY fill of +1 (entry->101) drops the
+        # reward distance to 6.5 and raises the risk distance to 6 -> RR ~1.08.
+        with patch(
+            "stocks.services.trading_engine.cost_model.DEFAULT_COST_MODEL.slipped_fill",
+            return_value=101.0,
+        ):
+            result = _build_intraday_candidate(
+                ticker_sym="TESTSTOCK", strategy_key="TEST", strategy_name="Test",
+                signal="BUY", price=100.0, entry=100.0, stop_loss=95.0, target=107.5,
+                rr=1.5, reason="test", score=4.0, priority=1, vol_ratio=1.5,
+            )
+
+        self.assertIsNone(result, "Must reject once the slippage-adjusted RR falls below 1.5")
+
+    def test_candidate_accepted_when_rr_still_clears_after_slippage(self):
+        """Sanity check: a candidate with real headroom must still pass."""
+        from stocks.services.intraday_service import _build_intraday_candidate
+
+        with patch(
+            "stocks.services.trading_engine.cost_model.DEFAULT_COST_MODEL.slipped_fill",
+            return_value=100.1,
+        ):
+            result = _build_intraday_candidate(
+                ticker_sym="RELIANCE", strategy_key="TEST", strategy_name="Test",
+                signal="BUY", price=100.0, entry=100.0, stop_loss=95.0, target=120.0,
+                rr=4.0, reason="test", score=4.0, priority=1, vol_ratio=1.5,
+                liquidity={"adv_inr": 1e9, "daily_vol_pct": 1.0},
+            )
+
+        self.assertIsNotNone(result)
+        self.assertGreaterEqual(result["rr"], 1.5)
 
 
 class OptionGreeksServiceTests(TestCase):

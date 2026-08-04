@@ -128,10 +128,20 @@ class OptionChainView(APIView):
         symbol = request.query_params.get('symbol', 'NIFTY').upper()
         force = request.query_params.get('force', 'false').lower() == 'true'
         cache_key = f'option_chain_{symbol}_5m'
-        
+
+        # Audit fix M20: OptionChainTable.jsx used to reimplement its own
+        # clock-only "is market open" check to decide whether to keep polling —
+        # contradicting this project's single-source-of-truth rule (NSE API via
+        # is_market_open(), not a client-side clock with no holiday awareness).
+        # Every response branch below carries this so the frontend can gate its
+        # poller on the same real signal every sibling engine's frontend already
+        # uses, instead of guessing from wall-clock time.
+        market_status = "OPEN" if is_market_open() else "CLOSED"
+
         if not force:
             cached_data = cache.get(cache_key)
             if cached_data:
+                cached_data["market_status"] = market_status
                 return Response(cached_data)
 
         # If market is closed, don't fetch new data
@@ -139,17 +149,20 @@ class OptionChainView(APIView):
             # Return cached data if available
             cached_data = cache.get(cache_key)
             if cached_data:
+                cached_data["market_status"] = market_status
                 return Response(cached_data)
-            
+
             # Fallback to the latest saved record in the database
             snapshot = get_option_chain_db_snapshot(symbol)
             if snapshot:
+                snapshot["market_status"] = market_status
                 return Response(snapshot)
 
-            return Response({})
+            return Response({"market_status": market_status})
 
         data = get_option_chain(symbol)
         cache.set(cache_key, data, timeout=60 * 5)  # Cache for 5 minutes
+        data["market_status"] = market_status
         return Response(data)
 
 
@@ -618,7 +631,13 @@ class NotificationView(APIView):
             notif_id = request.data.get('id')
             if notif_id:
                 try:
-                    notif = Notification.objects.get(id=notif_id)
+                    # Audit fix M4 (IDOR): must scope to this user's own notifications
+                    # (or the broadcast/global ones), matching the sibling GET/DELETE
+                    # handlers above — without this, any authenticated user could flip
+                    # is_read on any other user's row just by guessing/incrementing id.
+                    notif = Notification.objects.get(
+                        Q(user=request.user) | Q(user__isnull=True), id=notif_id,
+                    )
                     notif.is_read = True
                     notif.save()
                     return Response({"status": "Marked as read"})
@@ -643,6 +662,7 @@ class CronScannerTriggerView(APIView):
 
     def get(self, request):
         import os
+        import hmac
         import logging
         import threading
         from django.db import close_old_connections
@@ -660,7 +680,11 @@ class CronScannerTriggerView(APIView):
         if not secret_token:
             logger.error("[CRON] CRON_SECRET_TOKEN is not set — refusing all trigger requests.")
             return Response({"error": "Server misconfigured: CRON_SECRET_TOKEN not set"}, status=503)
-        if provided_token != secret_token:
+        # Audit fix M2: constant-time comparison — a plain `!=` on an internet-facing
+        # endpoint that can trigger production scanner actions leaks a timing
+        # side-channel proportional to the matching-prefix length. compare_digest()
+        # requires str/bytes of consistent type; provided_token may be None.
+        if not provided_token or not hmac.compare_digest(provided_token, secret_token):
             return Response({"error": "Unauthorized"}, status=401)
 
         # CENTRALIZED WEEKEND & HOLIDAY GUARD

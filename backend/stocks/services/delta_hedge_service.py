@@ -1116,6 +1116,16 @@ def build_specialist_hedge(symbol: str, exchange: str, spot_price: float, orch, 
             logger.info("[EM_CAP] Capped PE %.2f -> %.2f (limit=%.2f @ %.1fx EM)", pe_val, _get_strike(sell_pe), min_pe_strike, em_cap_mult)
 
     # --- 8. PREMIUM VELOCITY FILTER (Daily Theta Yield) ---
+    # Audit finding M5: margin_required is a flat 10%-of-notional HEURISTIC, not
+    # real SPAN/exposure margin (which is volatility- and moneyness-dependent) — no
+    # broker margin API is integrated here. This can screen trades wrong in both
+    # directions: a low-vol strike's real margin is likely well under 10% of
+    # notional (yield understated -> good trades wrongly rejected below), while a
+    # high-vol/near-the-money strike's real margin can exceed 10% (yield
+    # overstated -> a trade that wouldn't actually clear the real yield bar gets
+    # accepted). Left as a reject-only heuristic deliberately: erring toward
+    # rejecting more candidates is the safer failure direction for a risk-sensitive
+    # gate than loosening it without a real margin source to replace it.
     margin_required = 0.10 * calc_spot * lot_size
     ce_gr = calculate_greeks(calc_spot, _get_strike(sell_ce), t_days, sigma=live_iv, option_type='CE')
     pe_gr = calculate_greeks(calc_spot, _get_strike(sell_pe), t_days, sigma=live_iv, option_type='PE')
@@ -1757,12 +1767,15 @@ def _background_scan(tracked):
 
             created_signals = []
 
-            # 3.3a Select & Process Equities dynamically until we fill exactly 10 slots
-            MAX_EQUITY_SIGNALS = 10
+            # 3.3a Select & Process Equities dynamically until we fill all slots.
+            # Audit fix M7: this used to be a hardcoded `MAX_EQUITY_SIGNALS = 10`,
+            # silently overriding target_count (which IS settings-driven, via
+            # HEDGE_MAX_SIGNALS above) — raising HEDGE_MAX_SIGNALS in settings didn't
+            # actually raise the real cap. Use target_count directly.
             equity_count = len(tracked)
 
             for cand in candidate_equities:
-                if equity_count >= MAX_EQUITY_SIGNALS or slots_remaining <= 0:
+                if equity_count >= target_count or slots_remaining <= 0:
                     break  # Cap fully achieved!
 
                 spot_price = bulk_spots.get(cand["symbol"], 0)
@@ -2503,7 +2516,37 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
             q = {}
             
         cmp = float(q.get('ltp', 0))
-        
+
+        # Audit fix M6: previously only checked "is it non-zero" — on a
+        # circuit-frozen underlying, a stale last-print looks like a live,
+        # actionable price to the exit/rebalance logic below. Flag a leg suspect
+        # if its LTP hasn't moved across 3 consecutive polls while the underlying
+        # spot has moved meaningfully (>0.1%) — reuses the existing
+        # `is_theoretical` flag, already respected by the exit-check logic
+        # elsewhere in this file, so a suspect leg is excluded from auto-exit
+        # without inventing a second flag/code path.
+        if cmp > 0:
+            prev_cmp = leg.get('_stale_check_cmp')
+            prev_spot = leg.get('_stale_check_spot')
+            cur_spot = float(underlying_spot or 0)
+            if (prev_cmp is not None and prev_spot and cur_spot > 0
+                    and cmp == prev_cmp
+                    and abs(cur_spot - prev_spot) / prev_spot > 0.001):
+                leg['_stale_quote_polls'] = leg.get('_stale_quote_polls', 0) + 1
+                if leg['_stale_quote_polls'] >= 3 and not leg.get('is_theoretical'):
+                    leg['is_theoretical'] = True
+                    logger.warning(
+                        "[STALE_QUOTE_SUSPECT] %s %s %s: LTP frozen at %.2f across %d polls "
+                        "while spot moved %.2f -> %.2f — flagging theoretical (excluded from auto-exit).",
+                        symbol, leg.get('strike'), leg.get('option_type'), cmp,
+                        leg['_stale_quote_polls'], prev_spot, cur_spot,
+                    )
+            else:
+                leg['_stale_quote_polls'] = 0
+            leg['_stale_check_cmp'] = cmp
+            if cur_spot > 0:
+                leg['_stale_check_spot'] = cur_spot
+
         # SELF-HEALING: Theoretical fallback to avoid UI showing "--" un-usable data
         if cmp <= 0:
             # We must calculate t_days for theoretical fallback!
@@ -2599,7 +2642,15 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
 
     # 4. Status State Machine & Persistence
     if sig_id:
-        from stocks.models import SignalHistory
+        # Bug fix (found while testing M6): SignalHistory is already imported at
+        # module level (top of file) — this redundant local import shadowed it for
+        # the ENTIRE function scope (Python's scoping rules make a name local to a
+        # function if it's assigned anywhere in the function body, regardless of
+        # whether that assignment actually executes on a given call). That made
+        # `SignalHistory.Status.CANCELLED` at the P&L-suppression check further
+        # down raise UnboundLocalError on any call with persist_updates=False (or
+        # sig_id=None) that reached that check — dormant in production today only
+        # because the single live call site always passes persist_updates=True.
         try:
             sig = SignalHistory.objects.get(id=sig_id)
             current_metadata = sig.metadata or {}
@@ -2912,12 +2963,20 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
                 if new_status in [SignalHistory.Status.HIT_SL, SignalHistory.Status.HIT_TARGET, SignalHistory.Status.EXPIRED]:
                     # Direct closure logic for equities
                     final_pnl = sum([float(lf.get('pnl', 0)) for lf in updated_legs])
-                    total_entry_val = sum([float(lf.get('sell_price', 0)) * int(lf.get('lot_size', 1)) for lf in updated_legs])
+                    # Audit fix M9: only the currently-live legs' entry value belongs in the
+                    # % denominator — a rolled-away (EXPIRED) leg's original sell_price
+                    # inflates it, understating the true % return on a rolled position (the
+                    # rupee final_pnl above is already correct, since a frozen leg's pnl was
+                    # locked at its actual realized value when it was rolled).
+                    total_entry_val = sum([
+                        float(lf.get('sell_price', 0)) * int(lf.get('lot_size', 1))
+                        for lf in updated_legs if lf.get('status') != 'EXPIRED'
+                    ])
                     final_pnl_pct = (final_pnl / total_entry_val * 100) if total_entry_val > 0 else 0
-                    
+
                     sig.metadata['final_pnl'] = round(final_pnl, 2)
                     sig.metadata['final_pnl_pct'] = round(final_pnl_pct, 2)
-                    
+
                     try:
                         from stocks.services.telegram_service import maybe_send_telegram_exit
                         maybe_send_telegram_exit(sig, new_status)
@@ -2952,18 +3011,25 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
                 
                 if is_closing and was_active:
                     final_pnl = sum([float(l.get('pnl', 0)) for l in updated_legs])
-                    # Total collected premium used as base for percentage (roughly)
-                    total_entry_val = sum([float(l.get('sell_price', 0)) * int(l.get('lot_size', 1)) for l in updated_legs])
+                    # Audit fix M9: exclude rolled-away (EXPIRED) legs from the % denominator
+                    # — see the matching comment on the equities-only branch above.
+                    total_entry_val = sum([
+                        float(l.get('sell_price', 0)) * int(l.get('lot_size', 1))
+                        for l in updated_legs if l.get('status') != 'EXPIRED'
+                    ])
                     final_pnl_pct = (final_pnl / total_entry_val * 100) if total_entry_val > 0 else 0
-                    
+
                     sig.metadata['final_pnl'] = round(final_pnl, 2)
                     sig.metadata['final_pnl_pct'] = round(final_pnl_pct, 2)
                     logger.info("[STRATEGY] Locked Net P&L for %s: Rs.%.2f (%.2f%%)", sig.symbol, final_pnl, final_pnl_pct)
-                
+
                 # For active NSE specialist equities, always update and record the live P&L in metadata
                 elif is_equity and sig.status == SignalHistory.Status.ACTIVE:
                     final_pnl = sum([float(l.get('pnl', 0)) for l in updated_legs])
-                    total_entry_val = sum([float(l.get('sell_price', 0)) * int(l.get('lot_size', 1)) for l in updated_legs])
+                    total_entry_val = sum([
+                        float(l.get('sell_price', 0)) * int(l.get('lot_size', 1))
+                        for l in updated_legs if l.get('status') != 'EXPIRED'
+                    ])
                     final_pnl_pct = (final_pnl / total_entry_val * 100) if total_entry_val > 0 else 0
                     
                     sig.metadata['final_pnl'] = round(final_pnl, 2)

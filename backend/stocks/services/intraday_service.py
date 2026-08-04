@@ -152,6 +152,15 @@ def _build_intraday_candidate(
     if abs(stop_loss - entry) == 0:
         return None
 
+    # Audit fix M11: rr was computed above against the pre-slippage entry and never
+    # recomputed — a candidate that narrowly cleared the 1.5 RR gate before the
+    # slippage-adjusted fill could be persisted and displayed with a real RR below
+    # the platform's own stated minimum. Recompute against the actual fill price
+    # and re-check the same threshold.
+    rr = round(abs(target - entry) / abs(stop_loss - entry), 2)
+    if rr < 1.5:
+        return None
+
     # ── Risk-based sizing (§5.1) ─────────────────────────────────────────────────
     # Sized before the cost gate because real friction depends on notional: the ₹20
     # brokerage cap means cost-as-a-percentage falls as position size rises.
@@ -443,18 +452,31 @@ def get_live_signals(action: str | None = None) -> dict[str, Any]:
         return payload
 
     # ── Strict Action and Generation Router ──────────────────────────────────
-    # Once-per-day generation cap (added 2026-07-29 at the account owner's request):
-    # previously this checked whether a signal had been PERSISTED today, which meant
+    # Bounded-retry generation cap (added 2026-07-29 at the account owner's request
+    # as a one-shot-per-day gate; audit fix M10 relaxed it to a bounded retry).
+    # Originally this checked whether a signal had been PERSISTED today, which meant
     # a day where every attempt found zero qualifying candidates kept re-running the
     # full ~100-symbol universe scan (150-200 REST calls) every 15 min all day — a
-    # plausible contributor to Angel One rate-limit exhaustion on a bad day. Now gates
-    # on whether a generation ATTEMPT was made today, succeeded or not, so the
-    # automatic (action=None) path only ever scans once per day. An explicit
-    # action="generate" (Force Scan) still bypasses this — it's a deliberate manual
-    # override, not the passive 15-min auto-resolve path.
+    # plausible contributor to Angel One rate-limit exhaustion on a bad day. A hard
+    # one-attempt-per-day stop overcorrected: a bad opening range silently forfeited
+    # a good afternoon setup, contradicting the documented every-15-minutes cadence.
+    # Now retries generation up to INTRADAY_MAX_GENERATION_ATTEMPTS times per day,
+    # but ONLY while today's book is still empty — once anything from today exists
+    # (even a single signal), later cycles fall back to "update" regardless of
+    # attempt count, same as a successful day always behaved. An explicit
+    # action="generate" (Force Scan) still bypasses this entirely — it's a
+    # deliberate manual override, not the passive 15-min auto-resolve path.
     today_key = now_ist.date().isoformat()
-    generation_attempted_key = f"intraday_generation_attempted_{today_key}"
-    generation_already_attempted = cache.get(generation_attempted_key, False)
+    generation_attempted_key = f"intraday_generation_attempts_{today_key}"
+    MAX_GENERATION_ATTEMPTS_PER_DAY = int(getattr(settings, "INTRADAY_MAX_GENERATION_ATTEMPTS", 4))
+    attempts_so_far = cache.get(generation_attempted_key, 0)
+    is_first_attempt_today = attempts_so_far == 0
+    today_has_any_signal = SignalHistory.objects.filter(
+        category="intraday", generated_at__date=now_ist.date(),
+    ).exists()
+    generation_already_attempted = (
+        today_has_any_signal or attempts_so_far >= MAX_GENERATION_ATTEMPTS_PER_DAY
+    )
 
     resolved_action = action
     if resolved_action is None:
@@ -505,7 +527,7 @@ def get_live_signals(action: str | None = None) -> dict[str, Any]:
         return payload
 
     logger.info("[INTRADAY] Resolved action: GENERATE. Proceeding with active scan...")
-    cache.set(generation_attempted_key, True, timeout=12 * 3600)
+    cache.set(generation_attempted_key, attempts_so_far + 1, timeout=12 * 3600)
     # ────────────────────────────────────────────────────────────────────────
 
     # Liquidity- and cost-filtered universe. Index membership alone is a market-cap
@@ -774,9 +796,10 @@ def get_live_signals(action: str | None = None) -> dict[str, Any]:
             send_intraday_new_signals(newly_created)
         except Exception as tg_err:
             logger.error("[TELEGRAM] Intraday new-signal alert failed: %s", tg_err)
-    elif not generation_already_attempted:
-        # Day's first (now only) generation attempt found nothing — say so once
-        # rather than leaving silence to be interpreted as a bug.
+    elif is_first_attempt_today:
+        # Only the day's FIRST generation attempt found nothing gets a Telegram
+        # notice — with bounded retries (M10) now possible, later retry attempts
+        # finding nothing too must not resend the same "no setup" message.
         try:
             from stocks.services.telegram_service import send_no_setup_today
             send_no_setup_today("INTRADAY EQUITY", "INTRADAY_NO_SETUP")

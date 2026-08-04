@@ -48,16 +48,10 @@ class ProfileView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request):
-        user = request.user
-        # Precision enforcement for guest users at the view level
-        if getattr(user, 'is_temporary', False) and user.first_login_at:
-            from datetime import timedelta
-            if timezone.now() > user.first_login_at + timedelta(minutes=1):
-                user.delete()
-                return Response(
-                    {"detail": "Session expired."}, 
-                    status=status.HTTP_401_UNAUTHORIZED
-                )
-        
-        serializer = UserSerializer(user)
+        # Audit fix M3: the guest-session cutoff (and the row deletion that goes
+        # with it) is now enforced centrally in
+        # users.authentication.GuestSessionAwareJWTAuthentication, which runs
+        # before this view — every DRF endpoint gets it, not just this one. Any
+        # request that reaches this line already has an unexpired session.
+        serializer = UserSerializer(request.user)
         return Response(serializer.data)

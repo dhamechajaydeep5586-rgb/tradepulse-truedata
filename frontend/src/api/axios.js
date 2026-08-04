@@ -15,9 +15,24 @@ import axios from "axios";
 // blacklist-on-rotation is enabled (SIMPLE_JWT / token_blacklist in settings.py), so
 // a stolen refresh token is invalidated the next time the legitimate client rotates,
 // and the access token itself is short-lived (30 min).
+// Audit fix M18: no request timeout existed at all — a hung backend/TrueData call
+// left an action (e.g. Force Scan) spinning forever with no user-facing recovery.
 const API = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || "",
+  timeout: 20000,
 });
+
+// Distinct, easy-to-check timeout flag — axios already sets error.code ===
+// "ECONNABORTED" on a timeout, but callers shouldn't need to know that constant.
+API.interceptors.response.use(
+  (res) => res,
+  (error) => {
+    if (error.code === "ECONNABORTED" && /timeout/i.test(error.message || "")) {
+      error.isTimeout = true;
+    }
+    return Promise.reject(error);
+  },
+);
 
 // Attach JWT access token to every request
 API.interceptors.request.use((config) => {
@@ -50,6 +65,13 @@ API.interceptors.response.use(
 
     if (error.response?.status === 401 && !originalRequest._retry) {
       if (isRefreshing) {
+        // Audit fix M19: this used to leave _retry unset on queued requests — only
+        // the request that actually triggered the refresh got marked. If a queued
+        // request's retry independently 401'd again (e.g. the refreshed token is
+        // itself rejected for that resource), it re-entered this same interceptor
+        // with _retry still falsy and could loop back into another refresh attempt
+        // instead of failing cleanly.
+        originalRequest._retry = true;
         return new Promise((resolve, reject) => {
           failedQueue.push({ resolve, reject });
         })

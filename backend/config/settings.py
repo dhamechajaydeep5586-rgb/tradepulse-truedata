@@ -33,6 +33,18 @@ if 'test' in sys.argv:
         }
     }
 else:
+    # Audit fix M14 (documentation): every cooldown/halt/lock cache key in this
+    # codebase (scan-rate guards, DAILY_HALT_CACHE_KEY, OPTION_BUYING_DAILY_HALT_
+    # CACHE_KEY, specialist scanner throttles, etc.) depends on this single
+    # on-disk FileBasedCache with zero cross-host coordination. That's correct and
+    # intentional for the current single-instance deploy (see H1's single-worker
+    # guard in stocks/apps.py — this app is deliberately one process on one host).
+    # The moment a second host is ever added for redundancy, halt state and scan
+    # cooldowns stop being shared between them — each host would independently
+    # believe it owns the only copy of every lock/cooldown. Move this to Redis
+    # (or another shared cache backend) BEFORE horizontally scaling past one host;
+    # do not treat this as a drop-in swap without re-auditing every cache-key user
+    # for the same single-instance assumption.
     CACHES = {
         "default": {
             "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
@@ -167,7 +179,10 @@ AUTH_PASSWORD_VALIDATORS = [
 # ──────────────────────────────────────────────
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        # Audit fix M3: wraps JWTAuthentication to enforce the temporary/guest
+        # 60-second session cutoff on every endpoint, not just ProfileView —
+        # see users/authentication.py.
+        'users.authentication.GuestSessionAwareJWTAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
@@ -418,3 +433,43 @@ LONG_TERM_GENERATION_ENABLED = os.getenv("LONG_TERM_GENERATION_ENABLED", "true")
 SECURE_HSTS_SECONDS = 31536000
 SECURE_HSTS_INCLUDE_SUBDOMAINS = True
 SECURE_HSTS_PRELOAD = True
+
+# ──────────────────────────────────────────────
+# ERROR TRACKING (audit fix M22)
+# ──────────────────────────────────────────────
+# An unhandled exception in the 15-min scanner or the 2:30 PM option-buying
+# force-close path used to fail silently — nobody paged, positions could sit open
+# bleeding theta with no operator ever finding out. This is a no-op unless
+# SENTRY_DSN is set in the deployment env: no DSN, no import attempt beyond the
+# guarded try/except below, zero behavior change for any environment that hasn't
+# opted in. Set SENTRY_DSN (and optionally SENTRY_ENVIRONMENT) to activate.
+SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+if SENTRY_DSN and 'test' not in sys.argv:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.django import DjangoIntegration
+        from sentry_sdk.integrations.logging import LoggingIntegration
+
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            environment=os.getenv("SENTRY_ENVIRONMENT", "production" if not DEBUG else "development"),
+            integrations=[
+                DjangoIntegration(),
+                # Every logger.error(...) call already sprinkled through the
+                # scanner/audit/force-close code paths becomes a Sentry event too,
+                # not just an unhandled exception — most of those call sites catch
+                # and log rather than let the exception propagate, so relying on
+                # Sentry's default unhandled-exception capture alone would miss them.
+                LoggingIntegration(level=None, event_level="ERROR"),
+            ],
+            traces_sample_rate=0.0,  # error tracking only, no perf tracing overhead
+            send_default_pii=False,
+        )
+    except Exception:
+        # Never let error-tracking setup itself become a reason the app fails to
+        # start (e.g. sentry-sdk not yet installed in some environment).
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "SENTRY_DSN is set but sentry_sdk could not be initialized — "
+            "error tracking is inactive this run.", exc_info=True,
+        )

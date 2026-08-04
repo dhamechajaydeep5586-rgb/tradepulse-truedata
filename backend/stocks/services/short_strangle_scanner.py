@@ -1,11 +1,24 @@
 """
 short_strangle_scanner.py
 
+**EXPERIMENTAL / NOT WIRED TO THE SCHEDULER — audit finding M8.** This is a second,
+independently-parameterized strangle scanner that reuses several helper functions
+from the real engine (delta_hedge_service.py) but duplicates its own risk
+parameters and has NONE of that engine's production hardening: no rebalancing, no
+systematic stop-loss, no EOD close, no daily-loss halt, no concentration caps. The
+actually-scheduled strangle-selling path is `run_10am_strangle_scan` in updater.py
+→ `generate_strangle_signals` management command → delta_hedge_service.py; this
+file is reachable ONLY via the manual `scan_strangles` command below and is not
+called from anywhere else in the codebase. Diverging risk parameters between two
+scanners sharing helper functions is a maintenance trap — dangerous if this is ever
+repurposed or wired into automation without a full review against the real
+engine's hardening first.
+
 Standalone intraday short strangle scanner for NSE F&O stocks.
 Scans Nifty 50 stocks, applies intraday strike selection rules,
 validates delta / premium / spread, and returns qualifying setups.
 
-Usage (via management command):
+Usage (manual only, via management command):
     python manage.py scan_strangles --force
     python manage.py scan_strangles --force --symbols ADANIENT,RELIANCE,ITC
 """

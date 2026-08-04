@@ -50,6 +50,14 @@ class SignalHistory(models.Model):
                 name='unique_live_signal'
             )
         ]
+        indexes = [
+            # Audit fix M1: no composite index existed on the exact filter used on
+            # nearly every hot-path query in this codebase (stale-signal guards,
+            # daily-loss-limit sums, active/pending lookups per category) — query
+            # latency degrades as the 180-day retention window fills. ShortTermSignal
+            # already has the equivalent (sts_status_gen_idx); this model didn't.
+            models.Index(fields=['category', 'status', '-generated_at'], name='sh_cat_status_gen_idx'),
+        ]
 
     def __str__(self):
         return f"{self.symbol} {self.signal_type} @ {self.entry_price} ({self.status})"

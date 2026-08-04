@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import API from "../api/axios";
 import useSignalNotification from "../hooks/useSignalNotification";
 import { signalBadge, statusPillClass } from "./signalDisplay";
@@ -91,6 +91,11 @@ export default function LiveSignalsTable() {
   const [error, setError]             = useState(null);
   const [livePrices, setLivePrices]   = useState({});
   const [prevPrices, setPrevPrices]   = useState({});
+  // Audit fix M16: mirrors livePrices so the poller below can read the latest value
+  // without a stale interval-closure capture, without calling setPrevPrices from
+  // inside setLivePrices's updater (a rules-of-hooks violation that could
+  // double-fire under StrictMode/concurrent rendering).
+  const livePricesRef = useRef({});
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 15;
   const { permission, requestPermission, notifyNewSignals } = useSignalNotification("intraday");
@@ -103,19 +108,13 @@ export default function LiveSignalsTable() {
     return matchesFilter && matchesStatus;
   });
 
-  const isMarketOpen = () => {
-    const now = new Date();
-    const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30
-    const istTime = new Date(now.getTime() + istOffset);
-    const day = istTime.getUTCDay(); // 0=Sun, 1=Mon, ..., 6=Sat
-    if (day === 0 || day === 6) return false; // Weekend
-    const hours = istTime.getUTCHours();
-    const minutes = istTime.getUTCMinutes();
-    const totalMinutes = hours * 60 + minutes;
-    const openMinutes = 9 * 60 + 15; // 9:15
-    const closeMinutes = 15 * 60 + 30; // 15:30
-    return totalMinutes >= openMinutes && totalMinutes <= closeMinutes;
-  };
+  // Audit fix M20: trust the backend's NSE-API-backed market_status (already
+  // returned as data.market_status, used by `isOpen` above) instead of a local
+  // clock-only reimplementation — that check had no concept of NSE holidays, so a
+  // holiday within trading hours still polled at the 5-min "open" cadence.
+  // isOpenRef mirrors it for the interval callback below, which can't read the
+  // `isOpen` render variable directly since it's set up once on mount.
+  const isOpenRef = useRef(false);
 
   const fetchSignals = useCallback((force = false) => {
     // Only show skeleton on first load, use a more subtle indicator for background refreshes
@@ -126,6 +125,7 @@ export default function LiveSignalsTable() {
     API.get(url)
       .then((r) => {
         setData(r.data);
+        isOpenRef.current = r.data?.market_status === "OPEN";
         setLastRefreshed(new Date());
         setError(null);
         // Reset prices when main data changes
@@ -146,19 +146,27 @@ export default function LiveSignalsTable() {
   }, [notifyNewSignals]);
 
   useEffect(() => {
-    // On dashboard load, fetch current state (not force scan - backend runs on its own 5-min cycle)
-    if (isMarketOpen()) {
-      fetchSignals(false);
-    } else {
-      setLoading(false);
-    }
+    // On dashboard load, fetch current state (not force scan - backend runs on its
+    // own 5-min cycle). Always fetch — this is a cheap DB read, not a scan trigger
+    // (see CLAUDE.md), so there's no reason to gate it on a pre-fetch guess about
+    // market hours; the real market_status comes back with the response.
+    fetchSignals(false);
 
-    // Auto-refresh: 5 minutes when market is open, 30 minutes when closed
-    const intervalMs = isMarketOpen() ? 5 * 60 * 1000 : 30 * 60 * 1000;
+    // Auto-refresh: 5 minutes when market is open, 30 minutes when closed. Checked
+    // every minute rather than fixed once at mount, so cadence adapts if the
+    // session crosses the market open/close boundary while the tab stays open.
+    const CHECK_MS = 60 * 1000;
+    const OPEN_POLL_MS = 5 * 60 * 1000;
+    const CLOSED_POLL_MS = 30 * 60 * 1000;
+    let lastFetchAt = Date.now();
 
     const id = setInterval(() => {
-      fetchSignals(false);
-    }, intervalMs);
+      const cadence = isOpenRef.current ? OPEN_POLL_MS : CLOSED_POLL_MS;
+      if (Date.now() - lastFetchAt >= cadence) {
+        lastFetchAt = Date.now();
+        fetchSignals(false);
+      }
+    }, CHECK_MS);
 
     // Auto-refresh when user returns to the tab
     const handleVisibilityChange = () => {
@@ -183,6 +191,12 @@ export default function LiveSignalsTable() {
   useEffect(() => {
     if (data?.market_status !== "OPEN" || !data?.signals || data.signals.length === 0) return;
 
+    // Audit fix M17: no request-sequence guard existed on this 1s poller — an
+    // out-of-order response under variable latency could overwrite fresher state
+    // with stale data (a price briefly rolling backward). requestSeq increments
+    // per issued request; a response only applies if it's still the latest one.
+    let requestSeq = 0;
+
     const pollLivePrices = () => {
       const activeSymbols = data.signals
         .filter(s => ["ACTIVE", "PENDING"].includes(s.status))
@@ -190,14 +204,20 @@ export default function LiveSignalsTable() {
         .join(",");
       if (!activeSymbols) return;
 
+      const mySeq = ++requestSeq;
       const encodedSymbols = encodeURIComponent(activeSymbols);
       API.get(`/api/stocks/live-price-updates/?symbols=${encodedSymbols}`)
         .then(r => {
+          if (mySeq !== requestSeq) return; // a newer request already superseded this one
           if (Object.keys(r.data).length > 0) {
-            setLivePrices(prev => {
-              setPrevPrices(prevPricesState => ({ ...prevPricesState, ...prev }));
-              return { ...prev, ...r.data };
-            });
+            // Audit fix M16: read the latest snapshot from the ref (avoids a stale
+            // interval-closure over `livePrices`) and update both states at the top
+            // level instead of nesting setPrevPrices inside setLivePrices's updater.
+            const prevSnapshot = livePricesRef.current;
+            const merged = { ...prevSnapshot, ...r.data };
+            livePricesRef.current = merged;
+            setPrevPrices(prevSnapshot);
+            setLivePrices(merged);
           }
         })
         .catch(err => console.debug("Live price poll error:", err));

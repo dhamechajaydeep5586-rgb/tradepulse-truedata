@@ -37,18 +37,27 @@ const DeltaHedgePanel = () => {
         });
     };
 
+    // Audit fix M17: no request-sequence guard existed on this 3s poller — an
+    // out-of-order response under variable latency could overwrite fresher state
+    // with stale data. requestSeqRef increments per issued request; a response
+    // only applies if it's still the latest one.
+    const requestSeqRef = useRef(0);
+
     const fetchData = useCallback(async (isRefresh = false, force = false) => {
         if (!isRefresh) setLoading(true);
+        const mySeq = ++requestSeqRef.current;
         try {
             const url = force ? '/api/stocks/delta-hedge/?force=true' : '/api/stocks/delta-hedge/';
             const response = await axios.get(url);
+            if (mySeq !== requestSeqRef.current) return; // a newer request already superseded this one
             setData(response.data);
             setError(null);
             isOpenRef.current = response.data?.market_status === "OPEN";
         } catch (err) {
+            if (mySeq !== requestSeqRef.current) return;
             setError(err.message);
         } finally {
-            setLoading(false);
+            if (mySeq === requestSeqRef.current) setLoading(false);
         }
     }, []);
 
