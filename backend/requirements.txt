@@ -1,3 +1,14 @@
+# Audit finding L11: loose version ranges with no lockfile — a fresh install can
+# resolve different exact versions than what's deployed and tested, elsewhere. A
+# proper lockfile needs generating from a clean, isolated venv (this repo doesn't
+# ship one; the last one used here had drifted from runtime.txt's pin — see the
+# manage.py check added for M24) — a `pip freeze` from a shared/system Python
+# environment would capture unrelated OS packages alongside the real
+# dependencies, which is worse than no lockfile at all. To generate one properly:
+#   python3.13 -m venv /tmp/lockenv && /tmp/lockenv/bin/pip install pip-tools
+#   /tmp/lockenv/bin/pip-compile requirements.txt --output-file=requirements-lock.txt
+# Commit the result and add `pip install -r requirements-lock.txt` to setup.sh /
+# the Render build command in place of requirements.txt.
 Django>=4.2,<5.0
 djangorestframework>=3.14,<4.0
 psycopg2-binary>=2.9,<3.0

@@ -419,10 +419,10 @@ def _run_daily_scanner_impl(relaxed: bool = False, send_telegram: bool = True):
             _send_telegram_scanner_summary([], direction)
         return []
 
-    # ── Step 2: Get Angel One Instance ──
+    # ── Step 2: Get TrueData Instance ──
     svc = get_truedata_instance()
     if not svc:
-        logger.error("[TRADE_ENGINE] Angel One instance not available")
+        logger.error("[TRADE_ENGINE] TrueData instance not available")
         return []
 
     # ── Step 3: Fetch NIFTY50 universe ──
@@ -679,7 +679,7 @@ def run_eod_evaluation():
 
     svc = get_truedata_instance()
     if not svc:
-        logger.error("[TRADE_ENGINE] Angel One not available for EOD")
+        logger.error("[TRADE_ENGINE] TrueData not available for EOD")
         return
 
     # Check active/tracking signals (ACTIVE, TARGET1, TARGET2)
@@ -1597,7 +1597,7 @@ def check_pending_activations():
 
     svc = get_truedata_instance()
     if not svc:
-        logger.error("[TRADE_ENGINE] Angel One instance not available for activation checker")
+        logger.error("[TRADE_ENGINE] TrueData instance not available for activation checker")
         return
 
     symbols = [s.symbol for s in pending_trades]

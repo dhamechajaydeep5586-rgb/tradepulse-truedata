@@ -5,7 +5,7 @@ This is the job that unblocks validation. The portfolio backtester and the walk-
 Monte Carlo framework can only measure a strategy against real history, and until this
 has run there is no history stored to measure against.
 
-It runs offline by design: Angel One enforces a ~1 request/second global lock and trips
+It runs offline by design: TrueData enforces a ~1 request/second global lock and trips
 a 5-minute circuit breaker on 403, so a full universe takes tens of minutes to hours.
 Resumable — re-running after an interruption only fetches the missing chunks.
 
@@ -50,7 +50,7 @@ class Command(BaseCommand):
         svc = get_truedata_instance()
         if not svc:
             raise CommandError(
-                "Angel One service unavailable — cannot backfill. Check credentials "
+                "TrueData service unavailable — cannot backfill. Check credentials "
                 "and that the session authenticates."
             )
 
@@ -75,7 +75,7 @@ class Command(BaseCommand):
         missing = [s for s in symbols if s not in token_map]
         if missing:
             self.stdout.write(self.style.WARNING(
-                f"No Angel One token for {len(missing)} symbol(s): {', '.join(missing[:10])}"
+                f"No TrueData token for {len(missing)} symbol(s): {', '.join(missing[:10])}"
             ))
 
         resolved = [(s, token_map[s]) for s in symbols if s in token_map]
@@ -170,7 +170,7 @@ class Command(BaseCommand):
                           f"with >=80% symbol coverage")
         self.stdout.write("")
 
-        # Angel One serves progressively less intraday history the finer the interval;
+        # TrueData serves progressively less intraday history the finer the interval;
         # it silently returns its maximum window rather than erroring on an older range.
         if depth_days >= 500:
             self.stdout.write(self.style.SUCCESS(
@@ -182,7 +182,7 @@ class Command(BaseCommand):
         else:
             self.stdout.write(self.style.ERROR(
                 f"  INSUFFICIENT for validation ({depth_days} days).\n"
-                f"  Angel One caps intraday history per interval and silently returns\n"
+                f"  TrueData caps intraday history per interval and silently returns\n"
                 f"  its maximum window instead of erroring on an older request:\n"
                 f"     FIVE_MINUTE ~68d | FIFTEEN_MINUTE ~134d | ONE_DAY ~245d\n"
                 f"  A backtest on this measures whether the engine RUNS, not whether it\n"

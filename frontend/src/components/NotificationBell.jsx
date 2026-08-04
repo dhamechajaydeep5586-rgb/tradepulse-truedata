@@ -1,35 +1,71 @@
 import { useState, useEffect, useRef } from 'react';
 import API from '../api/axios';
 
-export default function NotificationBell() {
-  const [isOpen, setIsOpen] = useState(false);
-  const [notifications, setNotifications] = useState([]);
-  const [unreadCount, setUnreadCount] = useState(0);
-  const dropdownRef = useRef(null);
+// Audit fix L1: Dashboard.jsx mounts NotificationBell twice simultaneously
+// (mobile + desktop, CSS-hidden via Tailwind's md:hidden / hidden:md:flex, not
+// unmounted) so both instances used to poll independently — doubling the
+// request rate for no benefit. Rather than restructure Dashboard's responsive
+// header layout (risk of visually breaking one breakpoint without a way to
+// verify it here), the fetch/poll timer is lifted to a module-level singleton
+// shared by every mounted instance: exactly one network poll regardless of how
+// many bells are mounted, each instance just subscribes to the shared result.
+let sharedState = { notifications: [], unreadCount: 0 };
+const listeners = new Set();
+let pollIntervalId = null;
 
-  const fetchNotifications = async () => {
-    try {
-      const response = await API.get('/api/stocks/notifications/');
-      setNotifications(response.data.notifications || []);
-      setUnreadCount(response.data.unread_count || 0);
-    } catch (err) {
-      console.error('Error fetching notifications:', err);
+async function fetchNotificationsShared() {
+  try {
+    const response = await API.get('/api/stocks/notifications/');
+    sharedState = {
+      notifications: response.data.notifications || [],
+      unreadCount: response.data.unread_count || 0,
+    };
+    listeners.forEach((listener) => listener(sharedState));
+  } catch (err) {
+    console.error('Error fetching notifications:', err);
+  }
+}
+
+function subscribeToNotifications(listener) {
+  listeners.add(listener);
+  if (listeners.size === 1) {
+    fetchNotificationsShared();
+    pollIntervalId = setInterval(fetchNotificationsShared, 15000); // Check every 15s
+  } else {
+    // A second (or later) mounted instance starts from whatever the shared
+    // singleton already knows, instead of waiting for the next 15s tick.
+    listener(sharedState);
+  }
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0 && pollIntervalId) {
+      clearInterval(pollIntervalId);
+      pollIntervalId = null;
     }
   };
+}
+
+export default function NotificationBell() {
+  const [isOpen, setIsOpen] = useState(false);
+  const [notifications, setNotifications] = useState(sharedState.notifications);
+  const [unreadCount, setUnreadCount] = useState(sharedState.unreadCount);
+  const dropdownRef = useRef(null);
 
   useEffect(() => {
-    fetchNotifications();
-    const interval = setInterval(fetchNotifications, 15000); // Check every 15s
-    
+    const unsubscribe = subscribeToNotifications((state) => {
+      setNotifications(state.notifications);
+      setUnreadCount(state.unreadCount);
+    });
+
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        fetchNotifications();
+        fetchNotificationsShared();
       }
     };
-    
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
-      clearInterval(interval);
+      unsubscribe();
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, []);
@@ -48,7 +84,7 @@ export default function NotificationBell() {
   const handleMarkAllRead = async () => {
     try {
       await API.patch('/api/stocks/notifications/', { action: 'mark_all_read' });
-      fetchNotifications();
+      fetchNotificationsShared();
     } catch (err) {
       console.error(err);
     }
@@ -57,7 +93,7 @@ export default function NotificationBell() {
   const handleClearAll = async () => {
     try {
       await API.delete('/api/stocks/notifications/');
-      fetchNotifications();
+      fetchNotificationsShared();
     } catch (err) {
       console.error(err);
     }
@@ -67,7 +103,7 @@ export default function NotificationBell() {
     if (isRead) return;
     try {
       await API.patch('/api/stocks/notifications/', { action: 'mark_read', id });
-      fetchNotifications();
+      fetchNotificationsShared();
     } catch (err) {
       console.error(err);
     }
@@ -126,12 +162,25 @@ export default function NotificationBell() {
             ) : (
               <ul className="space-y-2">
                 {notifications.map((n) => (
-                  <li 
+                  <li
                     key={n.id}
                     onClick={() => handleNotificationClick(n.id, n.is_read)}
+                    // Audit fix L2: click-only rows had no keyboard/screen-reader
+                    // affordance — role="button" + tabIndex + onKeyDown lets
+                    // keyboard users tab to a notification and activate it with
+                    // Enter/Space, matching native button semantics.
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        handleNotificationClick(n.id, n.is_read);
+                      }
+                    }}
+                    aria-label={`${n.title}. ${n.is_read ? 'Read' : 'Unread'}. ${n.message}`}
                     className={`cursor-pointer rounded-lg border p-3 transition ${
-                      n.is_read 
-                        ? 'border-transparent bg-gray-800/50 hover:bg-gray-800 opacity-75' 
+                      n.is_read
+                        ? 'border-transparent bg-gray-800/50 hover:bg-gray-800 opacity-75'
                         : 'border-gray-700 bg-gray-800 hover:border-gray-600'
                     }`}
                   >

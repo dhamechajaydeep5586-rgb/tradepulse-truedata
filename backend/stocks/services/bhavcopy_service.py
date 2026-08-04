@@ -59,15 +59,30 @@ def _get_session() -> requests.Session:
     return session
 
 
+def _extract_csv_from_zip(zf: zipfile.ZipFile) -> pd.DataFrame:
+    """Select the CSV member explicitly by suffix rather than blindly taking
+    zf.namelist()[0] — audit fix L7: NSE's bhavcopy archives have historically
+    been single-file zips, but nothing guarantees that stays true (an added
+    readme/checksum file, or a reordered listing, would silently feed the wrong
+    file into pd.read_csv with no error). Errors loudly if no .csv member exists,
+    or if more than one does (ambiguous — better to fail than guess).
+    """
+    csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+    if not csv_names:
+        raise ValueError(f"No .csv file found in bhavcopy zip (members: {zf.namelist()})")
+    if len(csv_names) > 1:
+        raise ValueError(f"Ambiguous bhavcopy zip — multiple .csv members found: {csv_names}")
+    with zf.open(csv_names[0]) as csv_file:
+        return pd.read_csv(csv_file)
+
+
 def _download_csv(session: requests.Session, url: str) -> pd.DataFrame:
     """Download the ZIP, extract the CSV, return a DataFrame."""
     resp = session.get(url, timeout=30)
     resp.raise_for_status()
 
     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-        csv_name = zf.namelist()[0]
-        with zf.open(csv_name) as csv_file:
-            df = pd.read_csv(csv_file)
+        df = _extract_csv_from_zip(zf)
 
     # Normalise column names (strip whitespace)
     df.columns = df.columns.str.strip()
@@ -192,10 +207,19 @@ def _find_available_date(session: requests.Session, target_date: date) -> tuple[
         resp = session.get(url, timeout=30)
 
         if resp.status_code == 200:
-            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                csv_name = zf.namelist()[0]
-                with zf.open(csv_name) as csv_file:
-                    df = pd.read_csv(csv_file)
+            try:
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                    df = _extract_csv_from_zip(zf)
+            except (zipfile.BadZipFile, ValueError) as zip_err:
+                # A malformed/ambiguous archive for this specific date shouldn't
+                # abort the whole lookback search — treat it like an unavailable
+                # day and keep walking back, but log loudly since this is not the
+                # expected "just wasn't published yet" 404 case.
+                logger.warning("Bhavcopy zip for %s unusable (%s) — trying an earlier date.", attempt, zip_err)
+                attempt -= timedelta(days=1)
+                while attempt.weekday() >= 5:
+                    attempt -= timedelta(days=1)
+                continue
             df.columns = df.columns.str.strip()
             if attempt != target_date:
                 logger.info("Bhavcopy not available for %s, using %s instead",

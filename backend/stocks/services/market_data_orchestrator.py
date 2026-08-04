@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 class MarketDataOrchestrator:
     """
     JD Market Data Orchestrator:
-    100% Angel One — no external fallback providers.
+    100% TrueData — no external fallback providers.
     """
     _instance = None
     
@@ -19,7 +19,7 @@ class MarketDataOrchestrator:
 
     def get_option_data(self, symbol: str, strike: float, option_type: str, expiry: str, exchange: str = "NSE") -> Dict[str, Any] | tuple[Dict[str, Any], str | None]:
         """
-        Unified Option Data Layer — Angel One only.
+        Unified Option Data Layer — TrueData only.
         """
         cache_key = f"orch_opt_{symbol}_{strike}_{option_type}_{expiry}"
         cached = cache.get(cache_key)
@@ -28,7 +28,7 @@ class MarketDataOrchestrator:
         res = {"ltp": 0, "delta": 0, "theta": 0, "provider": "NONE", "status": "PENDING"}
         token = None
         
-        # 1. Primary & Only Source: Angel One
+        # 1. Primary & Only Source: TrueData
         try:
             svc = get_truedata_instance()
             if svc:
@@ -40,10 +40,10 @@ class MarketDataOrchestrator:
 
                 if quote and quote.get("ltp", 0) > 0:
                     res.update(quote)
-                    res["provider"] = "Angel One"
+                    res["provider"] = "TrueData"
                     res["status"] = "LIVE"
         except Exception as e:
-            logger.error(f"[ORCHESTRATOR] Angel One failed for {symbol}: {e}")
+            logger.error(f"[ORCHESTRATOR] TrueData failed for {symbol}: {e}")
 
         # Note: We don't cache the token in the 2s cache as it's meant for LTP, 
         # but the caller can handle the tuple.
@@ -54,7 +54,7 @@ class MarketDataOrchestrator:
         return res
 
     def get_prices_bulk(self, symbols: list[str], exchange: str = "NSE") -> Dict[str, float]:
-        """Fetch multiple prices in one call via Angel One Bulk API."""
+        """Fetch multiple prices in one call via TrueData Bulk API."""
         results = {}
         if not symbols: return results
 
@@ -71,13 +71,13 @@ class MarketDataOrchestrator:
         if not remaining_symbols:
             return results
 
-        # 2. Resolve Tokens & Fetch Bulk from Angel One
+        # 2. Resolve Tokens & Fetch Bulk from TrueData
         try:
             svc = get_truedata_instance()
             if svc:
                 token_map = svc.get_token_map(remaining_symbols, exchange)
                 if token_map:
-                    # Angel One token_map is {symbol: token}
+                    # TrueData token_map is {symbol: token}
                     # get_bulk_quotes needs {exchange: [tokens]}
                     bulk_arg = {exchange: list(token_map.values())}
                     bulk_res = svc.get_bulk_quotes(bulk_arg)
@@ -95,7 +95,7 @@ class MarketDataOrchestrator:
                                     "ltp": ltp,
                                     "high": quote.get("high", 0),
                                     "low": quote.get("low", 0),
-                                    "provider": "angel_one_bulk",
+                                    "provider": "truedata_bulk",
                                     "status": "LIVE"
                                 }, 5)
 
@@ -109,7 +109,11 @@ class MarketDataOrchestrator:
                     res = self.get_price(s, exchange)
                     if res.get("ltp", 0) > 0:
                         results[s] = res["ltp"]
-                except:
+                except Exception as e:
+                    # Audit fix L8: a bare `except:` here masked real bugs
+                    # (typos, AttributeErrors, etc.) as indistinguishable from
+                    # "no price available" for this symbol.
+                    logger.warning("[ORCHESTRATOR] Fallback price fetch failed for %s: %s", s, e)
                     continue
 
         return results
@@ -122,7 +126,7 @@ class MarketDataOrchestrator:
         if cached_res:
             return cached_res
 
-        # Layer 2: Angel One Primary
+        # Layer 2: TrueData Primary
         try:
             svc = get_truedata_instance()
             if svc:
@@ -137,14 +141,14 @@ class MarketDataOrchestrator:
                         "ltp": quote["ltp"],
                         "high": quote.get("high", 0),
                         "low": quote.get("low", 0),
-                        "provider": "angel_one",
+                        "provider": "truedata",
                         "status": "LIVE",
                         "change_pct": quote.get("percentChange", 0)
                     }
                     cache.set(cache_key, res, 5)
                     return res
         except Exception as e:
-            logger.warning("[ORCHESTRATOR] Angel One failed for %s: %s", symbol, e)
+            logger.warning("[ORCHESTRATOR] TrueData failed for %s: %s", symbol, e)
 
         return {
             "symbol": symbol,

@@ -114,6 +114,10 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    # Audit fix L5: admin login has no brute-force protection and sits outside
+    # DRF's throttle classes entirely. Must run after AuthenticationMiddleware so
+    # request.path/method are available; see users/middleware.py.
+    'users.middleware.AdminLoginRateLimitMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -267,8 +271,16 @@ USE_TZ = True
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
-# WhiteNoise compression and caching
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+# WhiteNoise compression and caching. Manifest storage requires collectstatic to
+# have run — under the test runner (no build step), fall back to plain storage so
+# a test that renders a full template with {% static %} tags (e.g. Django admin's
+# login page, exercised by AdminLoginRateLimitTests) doesn't fail on a missing
+# manifest entry that has nothing to do with what's actually under test. Same
+# 'test' in sys.argv technique used for CACHES/DATABASES/SECRET_KEY above.
+if 'test' in sys.argv:
+    STATICFILES_STORAGE = 'django.contrib.staticfiles.storage.StaticFilesStorage'
+else:
+    STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'

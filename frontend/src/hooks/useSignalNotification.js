@@ -3,9 +3,16 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 export default function useSignalNotification(category = "intraday") {
   const [permission, setPermission] = useState("default");
   
-  // Track symbols that have ALREADY triggered a notification 
+  // Track symbols that have ALREADY triggered a notification
   // to avoid spamming the user on every 15-second refresh.
   const notifiedSymbols = useRef(new Set());
+  // Audit fix L3: this Set grew for the full browser session with no eviction,
+  // and the reset escape hatch (clearCache below) was exported but never called
+  // by any consumer. Signals are inherently daily (stale-signal guards cancel
+  // previous-day signals at scan start — see CLAUDE.md), so dedup keys from a
+  // previous day are permanently irrelevant once today starts. Auto-reset on a
+  // day boundary instead of relying on a caller to remember to invoke clearCache.
+  const notifiedDay = useRef(new Date().toDateString());
 
   useEffect(() => {
     if (!("Notification" in window)) {
@@ -31,6 +38,12 @@ export default function useSignalNotification(category = "intraday") {
   const notifyNewSignals = useCallback((signals) => {
     if (permission !== "granted") return;
     if (!signals || signals.length === 0) return;
+
+    const today = new Date().toDateString();
+    if (today !== notifiedDay.current) {
+      notifiedSymbols.current.clear();
+      notifiedDay.current = today;
+    }
 
     const newAlerts = [];
     

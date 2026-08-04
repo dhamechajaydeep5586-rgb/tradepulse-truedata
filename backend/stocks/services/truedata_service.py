@@ -372,11 +372,20 @@ class TrueDataService:
 
     def get_live_price_by_token(self, token: str | int, exchange: str = "NSE") -> dict[str, Any] | None:
         """Kept for call-site compatibility with the few places that call this
-        directly rather than get_stock_quote/get_bulk_quotes."""
+        directly rather than get_stock_quote/get_bulk_quotes.
+
+        Audit fix L9: this used to return any non-zero cached WS tick regardless
+        of age, bypassing the same staleness bound get_bulk_quotes() enforces
+        (audit fix C5) — a docstring elsewhere (market_data/ws_read.py) claimed
+        this function already did staleness checking, which wasn't true. Same
+        60s bound as get_bulk_quotes's WS path, for consistency.
+        """
         symbol = str(token)
         tick = get_stream_price(symbol)
         if tick and tick.get("ltp", 0) > 0:
-            return tick
+            age = time.time() - tick.get("fetch_time", 0)
+            if age < 60:
+                return tick
         return self.get_bulk_quotes({exchange: [symbol]}).get(f"{exchange}:{symbol}")
 
     # -------------------------------------------------------------- symbols

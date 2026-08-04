@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
-    help = "Backfill option-selling rows with strike, premium CMP, and expiry from Angel One."
+    help = "Backfill option-selling rows with strike, premium CMP, and expiry from TrueData."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -51,7 +51,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         svc = get_truedata_instance()
         if not svc:
-            raise CommandError("Angel One session is not available.")
+            raise CommandError("TrueData session is not available.")
 
         refresh_all = options["all"]
         limit = options["limit"]
@@ -78,7 +78,7 @@ class Command(BaseCommand):
 
         self.stdout.write(
             self.style.NOTICE(
-                f"Backfilling {len(rows)} option-selling rows from Angel One..."
+                f"Backfilling {len(rows)} option-selling rows from TrueData..."
             )
         )
 
@@ -100,7 +100,7 @@ class Command(BaseCommand):
                 failed += 1
                 self.stdout.write(
                     self.style.WARNING(
-                        f"[{idx}/{len(rows)}] {row.symbol}: no Angel One option quote for {strike} {option_type}"
+                        f"[{idx}/{len(rows)}] {row.symbol}: no TrueData option quote for {strike} {option_type}"
                     )
                 )
                 continue
@@ -112,7 +112,7 @@ class Command(BaseCommand):
                 failed += 1
                 self.stdout.write(
                     self.style.WARNING(
-                        f"[{idx}/{len(rows)}] {row.symbol}: invalid premium from Angel One quote"
+                        f"[{idx}/{len(rows)}] {row.symbol}: invalid premium from TrueData quote"
                     )
                 )
                 continue

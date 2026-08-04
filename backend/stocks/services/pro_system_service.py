@@ -118,11 +118,11 @@ def get_market_direction() -> dict[str, Any]:
                     "ema20": round(float(ema20), 2),
                     "ema50": round(float(ema50), 2),
                     "rule": "Bullish → only BUY stocks | Bearish → avoid fresh buys" if trend == "BULLISH" else "Bearish → avoid fresh buys (or strict short term only)",
-                    "source": "angel_one"
+                    "source": "truedata"
                 }
-            logger.warning("Angel One Nifty data empty/insufficient (%d rows)", len(df) if not df.empty else 0)
+            logger.warning("TrueData Nifty data empty/insufficient (%d rows)", len(df) if not df.empty else 0)
     except Exception as ao_err:
-        logger.error("Angel One market direction failed: %s", ao_err)
+        logger.error("TrueData market direction failed: %s", ao_err)
 
     return {"trend": "NEUTRAL", "close": 0, "ema20": 0, "ema50": 0, "rule": "Could not fetch market direction"}
 
@@ -218,7 +218,7 @@ def _analyze_short_term(ticker: str, df: pd.DataFrame, min_vol_ratio: float = 1.
     }
 
 def scan_short_term_stocks() -> list[dict]:
-    """Scan NIFTY50 for Top 5-10 Short Term Setups using Angel One API.
+    """Scan NIFTY50 for Top 5-10 Short Term Setups using TrueData API.
 
     Narrowed from Nifty 500 to NIFTY50 2026-07-28 — _fetch_nifty500_symbols() (name
     kept as-is to avoid touching every call site) now sources NIFTY50 constituents,
@@ -227,7 +227,7 @@ def scan_short_term_stocks() -> list[dict]:
     from stocks.services.truedata_service import get_truedata_instance
     svc = get_truedata_instance()
     if not svc:
-        logger.error("Angel One instance not available for short term scan")
+        logger.error("TrueData instance not available for short term scan")
         return []
 
     # 1a. Try fetching live NIFTY50 list from NSE (403-prone from cloud IPs)
@@ -298,7 +298,7 @@ def scan_short_term_stocks() -> list[dict]:
         sym = cand["symbol"]
         tok = cand["token"]
 
-        # Fetch daily candle data from Angel One API
+        # Fetch daily candle data from TrueData API
         df = candle_store.get_candles(svc, sym, tok, "ONE_DAY", lookback_days=365, exchange="NSE")
         if df.empty or len(df) < 100: continue
         
@@ -378,7 +378,7 @@ def _fetch_long_term_quality(symbol: str, svc) -> dict | None:
 
 def scan_long_term_stocks() -> list[dict]:
     """
-    Scan NIFTY50 for Long Term quality stocks using Angel One API.
+    Scan NIFTY50 for Long Term quality stocks using TrueData API.
 
     Narrowed from Nifty 500 to NIFTY50 2026-07-28 (see shared/profiles.py for why).
     The bulk-quote liquidity prefilter below predates that narrowing — it was sized
@@ -388,7 +388,7 @@ def scan_long_term_stocks() -> list[dict]:
     from stocks.services.truedata_service import get_truedata_instance
     svc = get_truedata_instance()
     if not svc:
-        logger.error("Angel One instance not available for long term scan")
+        logger.error("TrueData instance not available for long term scan")
         return []
 
     try:
@@ -432,7 +432,7 @@ def scan_long_term_stocks() -> list[dict]:
     results = []
     import time
     for sym in top_candidates:
-        time.sleep(0.35)  # Rate limit safety: 3 req/sec limit on Angel One historical API
+        time.sleep(0.35)  # Rate limit safety: 3 req/sec limit on TrueData historical API
         res = _fetch_long_term_quality(sym, svc)
         if res:
             results.append(res)
@@ -574,7 +574,7 @@ def update_long_term_outcomes() -> dict[str, Any]:
 
     svc = get_truedata_instance()
     if not svc:
-        logger.warning("[LONG_TERM][AUDIT] Angel One instance unavailable — skipping this cycle.")
+        logger.warning("[LONG_TERM][AUDIT] TrueData instance unavailable — skipping this cycle.")
         return {"checked": 0, "closed": 0, "reason": "service_unavailable"}
 
     closed = 0

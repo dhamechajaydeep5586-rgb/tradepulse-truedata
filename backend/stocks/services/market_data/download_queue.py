@@ -64,7 +64,7 @@ def enqueue_next_trickle_symbol(interval: str = "ONE_DAY") -> DownloadRequest | 
 
     Why one at a time: the 2026-07-27 rate-limit incident showed shared/universe.py's
     _liquidity_stats() doing ~150-200 candle calls back-to-back at scan time — paced at
-    1.5s/call (respecting Angel One's own documented per-second limit) but still all
+    1.5s/call (respecting TrueData's own documented per-second limit) but still all
     crammed into the first few minutes of every 15-min cycle, i.e. a burst. Spreading
     the exact same work across one tick per symbol (see updater.py for the interval)
     means the local CandleBar store fills in gradually instead. Once warm,
@@ -73,7 +73,7 @@ def enqueue_next_trickle_symbol(interval: str = "ONE_DAY") -> DownloadRequest | 
 
     Does NOT fix an already-blocked account — a single isolated call fails identically
     to a burst (confirmed 2026-07-27 with a standalone script making exactly one
-    request). Only reduces how often bursts happen once Angel One access is normal.
+    request). Only reduces how often bursts happen once TrueData access is normal.
     """
     universe = get_universe_symbols()
     if not universe:
@@ -168,7 +168,7 @@ def drain_once(svc, batch_limit: int = 200) -> dict:
     summary = {"picked": 0, "done": 0, "failed": 0, "skipped_no_token": 0, "requeued": 0}
 
     if svc is None:
-        logger.info("[DOWNLOAD_QUEUE] No Angel One service instance available; skipping drain.")
+        logger.info("[DOWNLOAD_QUEUE] No TrueData service instance available; skipping drain.")
         return summary
 
     summary["requeued"] = _requeue_failed_rows(batch_limit)

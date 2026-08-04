@@ -489,7 +489,7 @@ class DashboardSummaryView(APIView):
     """
     GET /api/stocks/dashboard-summary/ — top-3-per-category preview for the Dashboard's
     preview cards. DB-reads only, never calls truedata_service directly, so it can be
-    hit on every dashboard load without adding any Angel One REST call volume.
+    hit on every dashboard load without adding any TrueData REST call volume.
     """
     permission_classes = (IsAuthenticated,)
 
@@ -767,7 +767,7 @@ class CronScannerTriggerView(APIView):
                     from stocks.services import candle_store
                     svc = get_truedata_instance()
                     if not svc:
-                        logger.error("[BACKFILL_UNIVERSE] No Angel One service instance available.")
+                        logger.error("[BACKFILL_UNIVERSE] No TrueData service instance available.")
                         return
                     symbols = get_universe_symbols()
                     logger.info("[BACKFILL_UNIVERSE] Starting ONE_DAY backfill for %d symbols...", len(symbols))
@@ -785,7 +785,7 @@ class CronScannerTriggerView(APIView):
 
         # One-off diagnostic, added 2026-07-28: verifies option_buying_service.py's
         # NIFTY50 ∩ F&O candidate intersection (added earlier today) isn't empty or
-        # near-empty due to a symbol-naming mismatch between Angel One's F&O
+        # near-empty due to a symbol-naming mismatch between TrueData's F&O
         # instrument master and the NSE NIFTY50 CSV — the one real bug risk in
         # today's narrowing change, never actually confirmed against live data.
         if action == "debug_option_buying_candidates":
@@ -794,7 +794,7 @@ class CronScannerTriggerView(APIView):
             from stocks.models import SignalHistory
             svc = get_truedata_instance()
             if not svc:
-                return Response({"status": "Error", "message": "No Angel One instance"}, status=500)
+                return Response({"status": "Error", "message": "No TrueData instance"}, status=500)
             fo_stocks = set(svc.get_fo_stocks())
             nifty50 = set(get_universe_symbols())
             overlap = fo_stocks & nifty50
@@ -831,7 +831,7 @@ class CronScannerTriggerView(APIView):
         # single 10:00 AM attempt errors out on every symbol otherwise has to wait until
         # tomorrow to retry. This clears today's cache key so the next 15-min
         # run_periodic_scanners cycle re-attempts generation in the same production
-        # process (avoids opening a second concurrent Angel One session).
+        # process (avoids opening a second concurrent TrueData session).
         if action == "clear_option_buying_cap":
             from django.core.cache import cache as dj_cache
             from stocks.services.signal_utils import IST

@@ -1687,6 +1687,106 @@ class ResolveTargetExpiryTests(TestCase):
         self.assertIsNone(resolve_target_expiry([], min_days=3))
 
 
+class BhavcopyZipExtractionTests(TestCase):
+    """
+    Audit fix L7: _download_csv/_find_available_date used to blindly take
+    zf.namelist()[0] with no name/count check — an added readme/checksum file, or
+    a reordered listing, would silently feed the wrong file into pd.read_csv.
+    """
+
+    def _make_zip(self, files: dict) -> "zipfile.ZipFile":
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for name, content in files.items():
+                zf.writestr(name, content)
+        buf.seek(0)
+        return zipfile.ZipFile(buf)
+
+    def test_selects_the_only_csv_member(self):
+        from stocks.services.bhavcopy_service import _extract_csv_from_zip
+
+        zf = self._make_zip({"BhavCopy_NSE_CM.csv": "SYMBOL,CLOSE\nRELIANCE,2500\n"})
+        df = _extract_csv_from_zip(zf)
+
+        self.assertEqual(list(df.columns), ["SYMBOL", "CLOSE"])
+        self.assertEqual(df.iloc[0]["SYMBOL"], "RELIANCE")
+
+    def test_raises_when_no_csv_present(self):
+        from stocks.services.bhavcopy_service import _extract_csv_from_zip
+
+        zf = self._make_zip({"readme.txt": "not a csv"})
+        with self.assertRaises(ValueError):
+            _extract_csv_from_zip(zf)
+
+    def test_raises_when_multiple_csvs_present_ambiguous(self):
+        from stocks.services.bhavcopy_service import _extract_csv_from_zip
+
+        zf = self._make_zip({
+            "BhavCopy_NSE_CM.csv": "SYMBOL,CLOSE\nRELIANCE,2500\n",
+            "extra.csv": "SYMBOL,CLOSE\nTCS,3500\n",
+        })
+        with self.assertRaises(ValueError):
+            _extract_csv_from_zip(zf)
+
+    def test_ignores_non_csv_sibling_file(self):
+        """A CSV alongside an unrelated file (e.g. a checksum) must still resolve
+        correctly — not just the single-file case."""
+        from stocks.services.bhavcopy_service import _extract_csv_from_zip
+
+        zf = self._make_zip({
+            "BhavCopy_NSE_CM.csv": "SYMBOL,CLOSE\nRELIANCE,2500\n",
+            "checksum.md5": "abc123",
+        })
+        df = _extract_csv_from_zip(zf)
+        self.assertEqual(df.iloc[0]["SYMBOL"], "RELIANCE")
+
+
+class LivePriceByTokenFreshnessTests(TestCase):
+    """
+    Audit fix L9: get_live_price_by_token() returned any non-zero cached WS tick
+    regardless of age, bypassing the same staleness bound get_bulk_quotes()
+    enforces (C5) — a docstring elsewhere claimed this function already did
+    staleness checking, which wasn't true until now.
+    """
+
+    def test_fresh_ws_tick_returned_directly(self):
+        import time as time_module
+        from stocks.services import truedata_service as tds
+        from stocks.services.truedata_streamer import _STREAM_CACHE, _STREAM_LOCK
+
+        svc = tds.TrueDataService(username="dummy", password="dummy")
+        with _STREAM_LOCK:
+            _STREAM_CACHE["FRESH"] = {"ltp": 100.0, "source": "websocket", "fetch_time": time_module.time() - 5}
+        try:
+            result = svc.get_live_price_by_token("FRESH", exchange="NSE")
+        finally:
+            with _STREAM_LOCK:
+                _STREAM_CACHE.pop("FRESH", None)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["ltp"], 100.0)
+
+    def test_stale_ws_tick_falls_through_to_bulk_quotes(self):
+        import time as time_module
+        from stocks.services import truedata_service as tds
+        from stocks.services.truedata_streamer import _STREAM_CACHE, _STREAM_LOCK
+
+        svc = tds.TrueDataService(username="dummy", password="dummy")
+        with _STREAM_LOCK:
+            _STREAM_CACHE["STALE"] = {"ltp": 100.0, "source": "websocket", "fetch_time": time_module.time() - 90}
+        try:
+            with patch.object(svc, "get_bulk_quotes", return_value={}) as mock_bulk:
+                result = svc.get_live_price_by_token("STALE", exchange="NSE")
+                mock_bulk.assert_called_once()
+        finally:
+            with _STREAM_LOCK:
+                _STREAM_CACHE.pop("STALE", None)
+
+        self.assertIsNone(result)
+
+
 class DailyLossHaltArmsOnEmptyBookTests(TestCase):
     """
     Audit fix (C1): the daily loss halt must arm from today's closed SignalHistory

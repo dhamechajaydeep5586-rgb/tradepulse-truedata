@@ -1,7 +1,7 @@
 """
 live_signal_service.py (Refactored / Orchestration Layer)
 This file acts as the primary orchestrator for specialized signal engines.
-100% Angel One Infrastructure (yfinance purged).
+100% TrueData Infrastructure (yfinance purged).
 """
 
 from __future__ import annotations
@@ -506,7 +506,7 @@ def run_periodic_scanners(action: str | None = None):
     Guards against overlapping runs: a manual cron-trigger hit landing on the same
     moment as the scheduled 15-min cycle (or two manual triggers close together)
     would otherwise double the REST call rate from specialist+option_buying+intraday
-    running twice at once — enough on its own to trip the shared Angel One circuit
+    running twice at once — enough on its own to trip the shared TrueData circuit
     breaker (confirmed: a manual trigger fired right at a 15-min boundary tripped it
     within seconds). Mirrors the same lock pattern trade_engine.run_daily_scanner
     already uses for this exact reason.
@@ -526,11 +526,11 @@ def _run_periodic_scanners_impl(action: str | None = None):
     from django.db import close_old_connections
     close_old_connections()
     try:
-        # Initialize and connect Angel One session at start of cycle
+        # Initialize and connect TrueData session at start of cycle
         from stocks.services.truedata_service import get_truedata_instance
         svc = get_truedata_instance()
         if svc:
-            logger.info("[CRON] Angel One session successfully connected at start of cycle.")
+            logger.info("[CRON] TrueData session successfully connected at start of cycle.")
             
         # DEPRECATED 2026-07-28 (audit remediation): this used to route to
         # pro_system_service.get_pro_system_data(trigger_scan=True), the legacy
