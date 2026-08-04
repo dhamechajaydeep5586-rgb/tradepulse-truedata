@@ -271,4 +271,9 @@ def strategy_allowed(family: str, regime) -> bool:
         return bool(getattr(regime, "allow_momentum", True))
     if family == PULLBACK_FAMILY:
         return bool(getattr(regime, "allow_mean_reversion", True))
-    return True
+    # Fail closed, not open (audit fix H11 — same fail-open trap intraday_service's
+    # regime gate had before "Compression Breakout" was found bypassing it entirely).
+    # Both real families are covered above; an unrecognized one is blocked, loudly,
+    # rather than silently ungated.
+    logger.warning("[SWING_REGIME] Unclassified family %r — blocking by default.", family)
+    return False

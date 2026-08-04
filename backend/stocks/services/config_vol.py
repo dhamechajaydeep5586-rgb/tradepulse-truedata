@@ -39,6 +39,14 @@ INDEX_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 # ─────────────────────────────────────────────────────────────
 FORCE_EXIT_DTE = 1                   # Days to expiry to force-exit and block new entries
 
+# Audit fix (H2): rebalance_delta_neutral_strangle() had no counter/cooldown — the
+# same challenged leg could roll 5-6 times in a trending/whipsawing session, each
+# roll realizing a small loss chasing price, invisible in the headline SL%. Once a
+# leg hits this many rolls in one day, further rolls are skipped for the rest of
+# that day and the position falls back to the existing SL/delta-danger auto-exit
+# instead of continuing to chase price indefinitely.
+MAX_ROLLS_PER_DAY = 2
+
 # ─────────────────────────────────────────────────────────────
 # 5. EXECUTION CONTROLS
 # ─────────────────────────────────────────────────────────────

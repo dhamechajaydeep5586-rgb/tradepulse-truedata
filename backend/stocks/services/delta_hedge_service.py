@@ -29,7 +29,7 @@ from stocks.services.config_vol import (
     INTRADAY_MIN_PREMIUM_MORNING, INTRADAY_MIN_PREMIUM_MIDDAY,
     INTRADAY_MIN_PREMIUM_AFTERNOON,
     INTRADAY_PREMIUM_ASYMMETRY_TOLERANCE, MIN_INTRADAY_THETA_VELOCITY,
-    ASSIGNMENT_RISK_DELTA, INDEX_UNDERLYINGS,
+    ASSIGNMENT_RISK_DELTA, INDEX_UNDERLYINGS, MAX_ROLLS_PER_DAY,
 )
 from stocks.services.risk_state_engine import classify_risk_state, RiskState
 from stocks.services.vol_telegram_formatter import format_entry_signal, format_live_update
@@ -42,6 +42,29 @@ HIGH_BETA_SIGMA = 0.25
 FALLBACK_SIGMA = 0.30
 _HIGH_BETA_SYMBOLS = {"BAJAJ-AUTO", "ADANIENT", "BEL"}
 # ----------------------------------------
+
+# Audit fix (H3): the strangle scanner had no correlation or sector concentration
+# control — apply_portfolio_constraints()/build_correlation_clusters() are already
+# proven in intraday_service.py/pro_system_service.py but were never imported here.
+# Rather than build a whole new EngineProfile (most of its fields — factor_weights,
+# sizing_mode, cost model — are meaningless for a premium-selling scanner that ranks
+# candidates on VWAP/VA/range metrics, not the equity factor model), this derives
+# only the concentration-cap fields from INTRADAY via with_overrides(): a 10-position
+# book (HEDGE_MAX_SIGNALS) sits between intraday's 5-position and swing's ~10-15
+# position books, so max_per_sector/max_per_cluster are set a notch looser than
+# intraday's but the promoter-group % and correlation lookback stay short-dated
+# (30d), matching this engine's short (weekly-expiry) holding period rather than
+# swing's 90d or long-term's 250d.
+def _specialist_portfolio_profile():
+    from stocks.services.shared.profiles import INTRADAY
+    return INTRADAY.with_overrides(
+        name="specialist",
+        max_per_sector=int(getattr(settings, "HEDGE_MAX_PER_SECTOR", 3)),
+        max_per_cluster=int(getattr(settings, "HEDGE_MAX_PER_CLUSTER", 2)),
+        max_per_promoter_group_pct=float(getattr(settings, "HEDGE_MAX_PROMOTER_GROUP_PCT", 20.0)),
+        corr_lookback_days=30,
+        corr_threshold=float(getattr(settings, "HEDGE_CORRELATION_THRESHOLD", 0.65)),
+    )
 
 # --- Portfolio-heat risk gate (Audit Remediation Plan Phase 2 #2.8) ---
 # HEDGE_ACCOUNT_CAPITAL: denominator for portfolio_heat_pct — total open SELL-leg notional
@@ -287,28 +310,41 @@ def is_physical_settlement_risk(symbol: str, max_short_delta: float) -> bool:
 
 
 def get_lot_size(symbol: str, exchange: str) -> int:
-    """Fetch lot size dynamically from the option chain (nearest expiry)."""
+    """Fetch lot size dynamically from the option chain (nearest expiry).
+
+    Returns 0 — not a fabricated real-looking value — if the live lookup and the
+    small index-only fallback dict both miss. Audit fix H18: this used to silently
+    return 1 on any failure, and 1 is wrong by a factor of 50-1000x+ for almost
+    every real NSE lot size, corrupting target/SL premium math and per-lot credit
+    figures without anything logging it. Callers must treat 0 as "unknown" and
+    either abort (new-signal generation, no prior value exists) or keep whatever
+    lot_size they already had (existing-position P&L refresh) — never trade or
+    price against a bare 0 or a silently substituted 1.
+    """
     svc = get_truedata_instance()
-    if not svc:
-        return 1
+    if svc:
+        expiries = svc.get_expiry_list(symbol)
+        if expiries:
+            nearest = sorted(set(expiries), key=expiry_str_to_date)[0]
+            for contract in svc.get_option_chain(symbol, nearest):
+                try:
+                    ls = int(float(contract.get('lotsize', 0)))
+                    if ls > 0: return ls
+                except (ValueError, TypeError):
+                    continue
 
-    expiries = svc.get_expiry_list(symbol)
-    if expiries:
-        nearest = sorted(set(expiries), key=expiry_str_to_date)[0]
-        for contract in svc.get_option_chain(symbol, nearest):
-            try:
-                ls = int(float(contract.get('lotsize', 0)))
-                if ls > 0: return ls
-            except (ValueError, TypeError):
-                continue
-
-    # Robust Lot Size Fallbacks
+    # Robust Lot Size Fallbacks (indices only — real, not guessed)
     fallbacks = {
         'NIFTY': 50, 'BANKNIFTY': 15, 'FINNIFTY': 40, 'MIDCPNIFTY': 75,
     }
     if symbol in fallbacks: return fallbacks[symbol]
 
-    return 1
+    logger.error(
+        "[LOT_SIZE] Could not resolve a real lot size for %s/%s (no broker connection "
+        "or empty option chain, and not an index with a known fallback) — returning 0.",
+        symbol, exchange,
+    )
+    return 0
 
 def get_nse_option_strikes(symbol: str, spot_price: float) -> List[Dict[str, Any]]:
     """
@@ -619,6 +655,12 @@ def build_specialist_hedge(symbol: str, exchange: str, spot_price: float, orch, 
     """
     legs = []
     lot_size = get_lot_size(symbol, exchange)
+    if lot_size <= 0:
+        # No prior leg exists yet to fall back to (this is new-signal generation) —
+        # abort rather than build a strangle whose target/SL and credit math would
+        # be silently wrong (audit fix H18).
+        logger.error("[SPECIALIST] %s: cannot resolve a real lot size — skipping strangle build.", symbol)
+        return []
     calc_spot = spot_price
     _svc = get_truedata_instance()  # Local reference to avoid NameError
 
@@ -1657,6 +1699,47 @@ def _background_scan(tracked):
         # shift across the 50-stock universe.
         candidate_equities.sort(key=lambda x: x['confidence'], reverse=True)
 
+        # Audit fix (H3): apply sector/correlation/promoter-group concentration caps
+        # before candidates ever reach the per-symbol creation loop below — without
+        # this, candidates are ranked purely on today's consolidation profile with
+        # nothing stopping a "safe" 10-position book from being ten correlated names
+        # that all breach on the same macro trigger. Same machinery already proven in
+        # intraday_service.py / pro_system_service.py.
+        if candidate_equities:
+            try:
+                from stocks.services.shared.portfolio_risk import (
+                    apply_portfolio_constraints, build_correlation_clusters,
+                )
+                from stocks.services.shared.universe import get_sector_map
+
+                specialist_profile = _specialist_portfolio_profile()
+                open_positions = list(
+                    SignalHistory.objects.filter(
+                        category='specialist',
+                        status__in=[SignalHistory.Status.PENDING, SignalHistory.Status.ACTIVE],
+                    ).values("symbol")
+                )
+                sector_map = get_sector_map()
+                clusters = build_correlation_clusters(
+                    bg_svc, [c["symbol"] for c in candidate_equities], profile=specialist_profile,
+                )
+                accepted, rejected = apply_portfolio_constraints(
+                    candidate_equities, open_positions, sector_map, clusters,
+                    target_count, profile=specialist_profile,
+                )
+                if rejected:
+                    logger.info(
+                        "[SCANNER][H3] Concentration caps: %d accepted, %d rejected of %d candidates.",
+                        len(accepted), len(rejected), len(candidate_equities),
+                    )
+                candidate_equities = accepted
+            except Exception as pc_err:
+                # Fail open on the concentration-cap machinery itself (e.g. a sector
+                # CSV fetch failure) rather than blocking the whole scan — losing this
+                # control for one cycle is far less bad than losing the entire day's
+                # scan to an unrelated data-source hiccup.
+                logger.error("[SCANNER][H3] Portfolio constraint check failed, proceeding unfiltered: %s", pc_err)
+
         current_total_active = len(tracked)
         slots_remaining = max(0, target_count - current_total_active)
 
@@ -2234,6 +2317,21 @@ def rebalance_delta_neutral_strangle(sig, updated_legs, underlying_spot, sig_exc
         rolled_leg = pe_leg
         op_type = 'PE'
 
+    # Audit fix H2: cap rolls per day on this leg. Without this, a trending/whipsawing
+    # underlying can roll the same leg 5-6 times in one session, each roll realizing a
+    # small loss chasing price — a cost that never shows up in the headline SL%. Once
+    # the cap is hit for today, skip the roll and fall back to the existing SL/
+    # delta-danger auto-exit instead of continuing to chase price indefinitely.
+    today_iso = today_date.isoformat()
+    roll_count_today = rolled_leg.get('roll_count', 0) if rolled_leg.get('last_roll_date') == today_iso else 0
+    if roll_count_today >= MAX_ROLLS_PER_DAY:
+        logger.warning(
+            "[REBALANCE_CAP] %s %s leg has already rolled %d time(s) today (cap %d) — "
+            "skipping further rolls; SL/delta-danger will handle it from here.",
+            symbol, op_type, roll_count_today, MAX_ROLLS_PER_DAY,
+        )
+        return
+
     # Get option strikes
     strikes = get_nse_option_strikes(symbol, underlying_spot)
 
@@ -2321,14 +2419,20 @@ def rebalance_delta_neutral_strangle(sig, updated_legs, underlying_spot, sig_exc
         'cmp': new_cmp,
         'status': 'WAITING',
         'token': new_token,
-        'live_iv': sigma
+        'live_iv': sigma,
+        # Audit fix H2: carry the per-day roll count forward onto the new leg so the
+        # cap above sees the running total, not a reset-to-zero count every roll.
+        'roll_count': roll_count_today + 1,
+        'last_roll_date': today_iso,
     }
 
     # Initialize zones for the new leg
     new_leg['target_price'] = round_to_tick(new_cmp * 0.70, 0.05)
     new_leg['stop_loss_price'] = round_to_tick(new_cmp * 1.15, 0.05)
 
-    ls = get_lot_size(symbol, new_leg['exchange'])
+    # Audit fix H18: a failed fresh lookup must not overwrite the rolled leg's
+    # already-known-good lot_size with a fabricated value — fall back to it instead.
+    ls = get_lot_size(symbol, new_leg['exchange']) or rolled_leg.get('lot_size', 0)
     calculated = calculate_pnl(new_cmp, new_cmp, ls, 1)
     calculated['lot_size'] = ls
     # calculate_pnl() always returns PROFIT/LOSS/NEUTRAL for its 'status' key — never apply
@@ -2482,8 +2586,9 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
             leg['target_price'] = round_to_tick(baseline_price * 0.70, 0.05)
             leg['stop_loss_price'] = round_to_tick(baseline_price * 1.15, 0.05)
 
-            # Lot size detection
-            ls = get_lot_size(symbol, leg.get('exchange', 'NSE'))
+            # Lot size detection — fall back to this leg's own known-good value on a
+            # failed fresh lookup instead of overwriting it (audit fix H18).
+            ls = get_lot_size(symbol, leg.get('exchange', 'NSE')) or leg.get('lot_size', 0)
             calculated = calculate_pnl(leg['sell_price'], leg['cmp'], ls, 1)
             calculated['lot_size'] = ls
             leg.update(calculated)
@@ -2555,7 +2660,9 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
                             # Re-calculate target, stop loss, and PNL with new sell_price
                             l['target_price'] = round_to_tick(curr_cmp * 0.70, 0.05)
                             l['stop_loss_price'] = round_to_tick(curr_cmp * 1.15, 0.05)
-                            ls = get_lot_size(symbol, l.get('exchange', 'NSE'))
+                            # Fall back to this leg's own known-good lot_size on a failed
+                            # fresh lookup instead of overwriting it (audit fix H18).
+                            ls = get_lot_size(symbol, l.get('exchange', 'NSE')) or l.get('lot_size', 0)
                             calculated = calculate_pnl(l['sell_price'], l['cmp'], ls, 1)
                             calculated['lot_size'] = ls
                             l.update(calculated)
@@ -2589,7 +2696,9 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
                             # Re-calculate target, stop loss, and PNL with new sell_price
                             l['target_price'] = round_to_tick(curr_cmp * 0.70, 0.05)
                             l['stop_loss_price'] = round_to_tick(curr_cmp * 1.15, 0.05)
-                            ls = get_lot_size(symbol, l.get('exchange', 'NSE'))
+                            # Fall back to this leg's own known-good lot_size on a failed
+                            # fresh lookup instead of overwriting it (audit fix H18).
+                            ls = get_lot_size(symbol, l.get('exchange', 'NSE')) or l.get('lot_size', 0)
                             calculated = calculate_pnl(l['sell_price'], l['cmp'], ls, 1)
                             calculated['lot_size'] = ls
                             l.update(calculated)

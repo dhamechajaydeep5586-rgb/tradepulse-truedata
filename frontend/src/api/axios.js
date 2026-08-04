@@ -1,5 +1,20 @@
 import axios from "axios";
 
+// Audit finding H13 (assessed, deliberately deferred — not fixed in this pass):
+// both JWTs live in localStorage, fully exposed to any future XSS. The real fix is
+// httpOnly cookies, which is a coordinated backend+frontend change (cookie-setting
+// login/refresh endpoints, a DRF auth class reading the cookie instead of the
+// Authorization header, CSRF token plumbing since cookies are sent automatically,
+// CORS credentials, and an AuthContext that can no longer read its own "am I logged
+// in" state synchronously from localStorage). That's a full session-architecture
+// migration touching every authenticated request in the app — a bad edge case there
+// risks locking out every user, and it cannot be fully verified without a live
+// cross-origin browser test this environment can't run. Rather than ship that blind,
+// this was assessed and intentionally left for a supervised deploy with browser
+// testing. Partial, already-shipped mitigation: refresh-token rotation +
+// blacklist-on-rotation is enabled (SIMPLE_JWT / token_blacklist in settings.py), so
+// a stolen refresh token is invalidated the next time the legitimate client rotates,
+// and the access token itself is short-lived (30 min).
 const API = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || "",
 });

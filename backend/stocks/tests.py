@@ -1,4 +1,5 @@
-from datetime import datetime, date
+import os
+from datetime import datetime, date, time
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -401,10 +402,18 @@ class SpecialistSignalConsistencyTests(TestCase):
         Creating a second specialist signal for the same symbol on the same day
         should be caught by the duplicate guard in the scanner.
         The DB check used in the scanner must return True when a signal already exists.
-        """
-        from django.utils import timezone
 
-        # Create first signal
+        Uses a fixed, safe mid-day IST moment rather than real wall-clock time — this
+        test used to derive `today_start`/`today` by converting real "now" to IST, but
+        Django's generated_at__date lookup evaluates in settings.TIME_ZONE (UTC), so
+        the test was flaky for ~5.5h/day (IST 00:00-05:30, when the IST and UTC
+        calendar dates disagree — e.g. IST 00:03 is still the previous UTC date).
+        """
+        # Fixed IST moment safely mid-day, so its IST date and UTC date agree.
+        test_now = datetime(2026, 4, 1, 13, 0, tzinfo=IST)
+
+        # Create first signal, with generated_at pinned to test_now instead of
+        # auto_now_add's real "now".
         sig1 = SignalHistory.objects.create(
             symbol="BRITANNIA",
             entry_price=5324.0,
@@ -413,10 +422,9 @@ class SpecialistSignalConsistencyTests(TestCase):
             status=SignalHistory.Status.PENDING,
             metadata={"legs": [], "confidence": 85.0}
         )
+        SignalHistory.objects.filter(pk=sig1.pk).update(generated_at=test_now)
 
-        today_start = timezone.now().astimezone(
-            __import__("zoneinfo").ZoneInfo("Asia/Kolkata")
-        ).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = test_now.replace(hour=0, minute=0, second=0, microsecond=0)
 
         # Simulate the duplicate check used in _background_scan
         already_exists = SignalHistory.objects.filter(
@@ -433,9 +441,7 @@ class SpecialistSignalConsistencyTests(TestCase):
         count = SignalHistory.objects.filter(
             symbol="BRITANNIA",
             category="specialist",
-            generated_at__date=timezone.now().astimezone(
-                __import__("zoneinfo").ZoneInfo("Asia/Kolkata")
-            ).date()
+            generated_at__date=test_now.date()
         ).count()
         self.assertEqual(count, 1, "Should have exactly 1 signal for BRITANNIA today")
 
@@ -647,16 +653,23 @@ class MarketHolidayGuardTests(TestCase):
         """
         Requesting the manual cron trigger on weekends or holiday dates
         must immediately skip execution and return the appropriate JSON response.
+
+        CRON_SECRET_TOKEN must be set for this endpoint to accept any token at all
+        (audit fix: no hardcoded fallback) — this test's own token was the removed
+        hardcoded default, so it stopped matching once that fix shipped; set it via
+        the env var like a real deployment would, instead of relying on the old
+        literal.
         """
         from rest_framework.test import APIClient
         from unittest.mock import patch
 
         client = APIClient()
-        token = "trade_pulse_secure_cron_trigger_2026"
+        token = "test-cron-secret-token"
         url = f"/api/stocks/cron-trigger/?token={token}&action=generate"
 
         # Mock is_market_open_today to return False (simulating weekend/holiday)
-        with patch("stocks.services.signal_utils.is_market_open_today", return_value=False):
+        with patch.dict(os.environ, {"CRON_SECRET_TOKEN": token}), \
+             patch("stocks.services.signal_utils.is_market_open_today", return_value=False):
             response = client.get(url)
             self.assertEqual(response.status_code, 200)
             data = response.json()
@@ -665,17 +678,19 @@ class MarketHolidayGuardTests(TestCase):
     def test_cron_endpoint_executes_on_open_market(self):
         """
         Requesting manual cron trigger on a trading day must successfully queue
-        and execute scanners.
+        and execute scanners. See test_cron_endpoint_skips_on_closed_market's
+        docstring for why CRON_SECRET_TOKEN must be set explicitly here.
         """
         from rest_framework.test import APIClient
         from unittest.mock import patch
 
         client = APIClient()
-        token = "trade_pulse_secure_cron_trigger_2026"
+        token = "test-cron-secret-token"
         url = f"/api/stocks/cron-trigger/?token={token}&action=generate"
 
         # Mock is_market_open_today to return True (simulating open day)
-        with patch("stocks.services.signal_utils.is_market_open_today", return_value=True):
+        with patch.dict(os.environ, {"CRON_SECRET_TOKEN": token}), \
+             patch("stocks.services.signal_utils.is_market_open_today", return_value=True):
             # Patch run_periodic_scanners / scheduler to prevent actual live scanning in tests
             with patch("stocks.services.live_signal_service.run_periodic_scanners") as mock_scanner:
                 response = client.get(url)
@@ -847,6 +862,11 @@ class StranglePairSelectionTests(TestCase):
         """
         Verify that get_hedge_panel_data signature and logic accepts
         and integrates the sync_scan parameter without failing.
+
+        Pins `timezone.now()` to a fixed mid-session IST moment — the sync_scan path
+        only actually fires _background_scan when now_ist >= ENTRY_WINDOW_START
+        (10:45 AM), so this test was flaky depending on real wall-clock time whenever
+        the suite happened to run outside that window (e.g. late night IST).
         """
         from stocks.services.delta_hedge_service import get_hedge_panel_data
         from unittest.mock import patch, MagicMock
@@ -856,20 +876,24 @@ class StranglePairSelectionTests(TestCase):
         mock_svc.streamer = MagicMock()
         mock_svc.streamer.is_connected = True
 
+        test_now = datetime(2026, 4, 1, 13, 0, tzinfo=IST)  # safely inside ENTRY_WINDOW
+
         with patch("stocks.services.delta_hedge_service.get_truedata_instance", return_value=mock_svc), \
              patch("stocks.services.delta_hedge_service.cache") as mock_cache, \
              patch("stocks.services.delta_hedge_service.is_market_open", return_value=True), \
+             patch("stocks.services.delta_hedge_service.timezone") as mock_timezone, \
              patch("stocks.services.delta_hedge_service._background_scan") as mock_bg_scan:
-            
+
             mock_cache.get.return_value = None
-            
+            mock_timezone.now.return_value = test_now
+
             # Call with sync_scan=True
             res = get_hedge_panel_data(action="generate", sync_scan=True)
-            
+
             # Should have returned a valid panel dict
             self.assertIsInstance(res, dict)
             self.assertEqual(res.get("market_status"), "OPEN")
-            
+
             # Since sync_scan is True, it should have triggered _background_scan directly
             mock_bg_scan.assert_called_once()
 
@@ -955,6 +979,418 @@ class SpecialistStrangleInstitutionalUpgradesTests(TestCase):
             strikes_selected = [leg['strike'] for leg in res if leg['action'] == 'SELL']
             self.assertIn(120.0, strikes_selected)
             self.assertIn(80.0, strikes_selected)
+
+
+class SpecialistPortfolioConstraintTests(TestCase):
+    """
+    Audit fix H3: the strangle scanner had no correlation or sector concentration
+    control — apply_portfolio_constraints()/build_correlation_clusters() were already
+    proven in intraday_service.py/pro_system_service.py but never imported here. Now
+    wired into _background_scan() via a dedicated concentration-cap profile
+    (_specialist_portfolio_profile(), derived from INTRADAY's caps via
+    with_overrides() rather than a whole new EngineProfile, since most of that
+    dataclass's fields — factor weights, sizing mode, cost model — don't apply to a
+    premium-selling scanner).
+    """
+
+    def test_specialist_profile_has_sane_concentration_caps(self):
+        from stocks.services.delta_hedge_service import _specialist_portfolio_profile
+
+        profile = _specialist_portfolio_profile()
+        self.assertEqual(profile.name, "specialist")
+        self.assertGreaterEqual(profile.max_per_sector, 1)
+        self.assertGreaterEqual(profile.max_per_cluster, 1)
+        self.assertGreater(profile.max_per_promoter_group_pct, 0)
+        self.assertEqual(profile.corr_lookback_days, 30)
+
+    def test_sector_cap_rejects_excess_same_sector_candidates(self):
+        """The same apply_portfolio_constraints() machinery intraday_service.py
+        already relies on must reject candidates once the specialist profile's
+        sector cap is hit."""
+        from stocks.services.delta_hedge_service import _specialist_portfolio_profile
+        from stocks.services.shared.portfolio_risk import apply_portfolio_constraints
+
+        profile = _specialist_portfolio_profile()  # max_per_sector=3 by default
+        candidates = [
+            {"symbol": f"BANK{i}", "confidence": 90 - i} for i in range(5)
+        ]
+        sectors = {c["symbol"]: "FINANCIAL SERVICES" for c in candidates}
+
+        accepted, rejected = apply_portfolio_constraints(
+            candidates, [], sectors, {}, max_positions=10, profile=profile,
+        )
+
+        self.assertEqual(len(accepted), profile.max_per_sector)
+        self.assertEqual(len(rejected), len(candidates) - profile.max_per_sector)
+        self.assertTrue(all(r["reject_reason"].startswith("SECTOR_CAP") for r in rejected))
+
+    def test_open_positions_count_toward_sector_cap(self):
+        """Already-open specialist positions in a sector must count against new
+        candidates in the same sector, not just other candidates in this scan."""
+        from stocks.services.delta_hedge_service import _specialist_portfolio_profile
+        from stocks.services.shared.portfolio_risk import apply_portfolio_constraints
+
+        profile = _specialist_portfolio_profile()  # max_per_sector=3
+        open_positions = [{"symbol": f"OPEN{i}"} for i in range(profile.max_per_sector)]
+        candidates = [{"symbol": "NEWCAND", "confidence": 80}]
+        sectors = {**{c["symbol"]: "IT" for c in candidates},
+                   **{p["symbol"]: "IT" for p in open_positions}}
+
+        accepted, rejected = apply_portfolio_constraints(
+            candidates, open_positions, sectors, {}, max_positions=10, profile=profile,
+        )
+
+        self.assertEqual(len(accepted), 0)
+        self.assertEqual(rejected[0]["reject_reason"], "SECTOR_CAP:IT")
+
+    def test_background_scan_calls_constraint_filter_before_creating_signals(self):
+        """Integration check: _background_scan must run candidates through the
+        concentration-cap filter before build_specialist_hedge is ever called for
+        a rejected candidate."""
+        from stocks.services.delta_hedge_service import _background_scan
+
+        with patch("stocks.services.delta_hedge_service.get_orchestrator") as mock_get_orch, \
+             patch("stocks.services.delta_hedge_service.get_truedata_instance") as mock_get_svc, \
+             patch("stocks.services.delta_hedge_service.NIFTY_50_STOCKS", return_value=["SYMA", "SYMB"]), \
+             patch("stocks.services.delta_hedge_service.ENTRY_WINDOW_START", time(0, 0)), \
+             patch("stocks.services.delta_hedge_service.ENTRY_WINDOW_END", time(23, 59)), \
+             patch("stocks.services.delta_hedge_service.get_symbol_market_state", return_value={
+                 "is_within_va": True, "vah": 0, "val": 0, "confidence": 60,
+                 "current_price": 500.0, "metrics": {},
+             }), \
+             patch("stocks.services.shared.portfolio_risk.apply_portfolio_constraints") as mock_apc, \
+             patch("stocks.services.delta_hedge_service.build_specialist_hedge") as mock_build:
+            mock_orch = MagicMock()
+            mock_orch.get_price.return_value = {"ltp": 500.0, "high": 510.0, "low": 490.0}
+            mock_orch.get_prices_bulk.return_value = {}
+            mock_get_orch.return_value = mock_orch
+            mock_get_svc.return_value = MagicMock()
+            # Both candidates rejected by the concentration filter -> build_specialist_hedge
+            # (and therefore signal creation) must never be reached for either.
+            mock_apc.return_value = ([], [{"symbol": "SYMA"}, {"symbol": "SYMB"}])
+
+            _background_scan(tracked=set())
+
+            mock_apc.assert_called_once()
+            mock_build.assert_not_called()
+
+
+class StrangleRollCapTests(TestCase):
+    """
+    Audit fix H2: rebalance_delta_neutral_strangle() had no counter/cooldown — the
+    same challenged leg could roll 5-6 times in a trending/whipsawing session, each
+    roll realizing a small loss chasing price, invisible in the headline SL%. Now
+    capped at MAX_ROLLS_PER_DAY per leg, tracked via roll_count/last_roll_date
+    carried on the leg dict itself (not sig.metadata, which gets overwritten by the
+    caller right after this function returns).
+    """
+
+    def _legs(self, ce_delta_leg_extra=None):
+        ce = {
+            'option_type': 'CE', 'strike': 25000.0, 'expiry': '25JUN2026',
+            'status': 'WAITING', 'exchange': 'NSE', 'action': 'SELL', 'lots': -1,
+            'live_iv': 0.20, 'cmp': 15.0, 'symbol': 'MOCK', 'lot_size': 50,
+        }
+        if ce_delta_leg_extra:
+            ce.update(ce_delta_leg_extra)
+        pe = {
+            'option_type': 'PE', 'strike': 24000.0, 'expiry': '25JUN2026',
+            'status': 'WAITING', 'exchange': 'NSE', 'action': 'SELL', 'lots': -1,
+            'live_iv': 0.20, 'cmp': 10.0, 'symbol': 'MOCK', 'lot_size': 50,
+        }
+        return ce, pe
+
+    def test_roll_cap_blocks_further_rolls_same_day(self):
+        from stocks.services.delta_hedge_service import rebalance_delta_neutral_strangle
+        from stocks.services.config_vol import MAX_ROLLS_PER_DAY
+
+        today = datetime(2026, 6, 1).date()
+        ce, pe = self._legs({'roll_count': MAX_ROLLS_PER_DAY, 'last_roll_date': today.isoformat()})
+        updated_legs = [ce, pe]
+        sig = MagicMock(symbol="MOCK", id=1)
+
+        # CE more challenged than PE -> CE would be the rolled leg, but the cap
+        # must stop the roll before any strike/quote lookup happens at all.
+        with patch("django.utils.timezone.now") as mock_now, \
+             patch("stocks.services.option_greeks_service.calculate_greeks") as mock_greeks, \
+             patch("stocks.services.delta_hedge_service.get_nse_option_strikes") as mock_strikes:
+            mock_now.return_value.astimezone.return_value.date.return_value = today
+            mock_greeks.side_effect = [{'delta': 0.40}, {'delta': 0.20}]  # CE, PE
+
+            rebalance_delta_neutral_strangle(sig, updated_legs, 24500.0, "NSE", MagicMock())
+
+            mock_strikes.assert_not_called()
+
+        self.assertEqual(len(updated_legs), 2, "No new leg should have been appended")
+
+    def test_first_roll_of_day_stamps_count_and_date(self):
+        from stocks.services.delta_hedge_service import rebalance_delta_neutral_strangle
+
+        today = datetime(2026, 6, 1).date()
+        ce, pe = self._legs()  # no prior roll_count -> first roll of the day
+        updated_legs = [ce, pe]
+        sig = MagicMock(symbol="MOCK", id=1)
+
+        strikes = [
+            {'strike': 25000.0, 'expiry': '25JUN2026'},
+            {'strike': 25500.0, 'expiry': '25JUN2026'},
+        ]
+
+        with patch("django.utils.timezone.now") as mock_now, \
+             patch("stocks.services.option_greeks_service.calculate_greeks") as mock_greeks, \
+             patch("stocks.services.delta_hedge_service.get_nse_option_strikes", return_value=strikes), \
+             patch("stocks.services.delta_hedge_service.get_nse_option_quote", return_value={'ltp': 12.5}), \
+             patch("stocks.services.delta_hedge_service.get_lot_size", return_value=50), \
+             patch("stocks.services.telegram_service.send_telegram_message"):
+            mock_now.return_value.astimezone.return_value.date.return_value = today
+            # 2 calls to size the imbalance (CE, PE), then repeated calls per
+            # candidate strike while picking the roll target.
+            mock_greeks.side_effect = [
+                {'delta': 0.40}, {'delta': 0.20},  # imbalance check: CE, PE (target_delta=0.20)
+                {'delta': 0.35},  # candidate strike 25000 (== current strike; far from target)
+                {'delta': 0.22},  # candidate strike 25500 (closer to target -> gets picked)
+            ]
+
+            rebalance_delta_neutral_strangle(sig, updated_legs, 24500.0, "NSE", MagicMock())
+
+        self.assertEqual(len(updated_legs), 3, "A new rolled leg should have been appended")
+        new_leg = updated_legs[-1]
+        self.assertEqual(new_leg['roll_count'], 1)
+        self.assertEqual(new_leg['last_roll_date'], today.isoformat())
+
+
+class SingleWorkerGuardTests(TestCase):
+    """
+    Audit fix H1: the single-worker-process assumption (REST rate-limit lock,
+    TrueData's one-session-per-login limit, in-process APScheduler dedup, every
+    FileBasedCache-backed cooldown/halt key) was previously enforced only by a
+    comment next to `--workers 1` in start.sh / the Oracle systemd unit — nothing
+    failed loudly if that config drifted.
+    """
+
+    def test_real_render_invocation_passes(self):
+        """start.sh's actual gunicorn invocation must not trip the guard."""
+        from stocks.apps import _assert_single_gunicorn_worker
+
+        argv = [
+            "/opt/render/project/.venv/bin/python", "-m", "gunicorn",
+            "config.wsgi:application", "--bind", "0.0.0.0:10000",
+            "--workers", "1", "--worker-class", "gthread", "--threads", "4",
+            "--timeout", "300",
+        ]
+        with patch("sys.argv", argv), patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("WEB_CONCURRENCY", None)
+            _assert_single_gunicorn_worker()  # must not raise
+
+    def test_real_oracle_invocation_passes(self):
+        """The Oracle systemd unit's actual gunicorn invocation must not trip the guard."""
+        from stocks.apps import _assert_single_gunicorn_worker
+
+        argv = [
+            "/home/ubuntu/tradepulse-truedata/backend/venv/bin/gunicorn",
+            "config.wsgi:application", "--workers", "1",
+            "--worker-class", "gthread", "--threads", "4", "--timeout", "300",
+            "--bind", "unix:/run/tradepulse-backend.sock",
+        ]
+        with patch("sys.argv", argv), patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("WEB_CONCURRENCY", None)
+            _assert_single_gunicorn_worker()  # must not raise
+
+    def test_multiple_workers_flag_raises(self):
+        from stocks.apps import _assert_single_gunicorn_worker
+
+        argv = ["gunicorn", "config.wsgi:application", "--workers", "4"]
+        with patch("sys.argv", argv), patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("WEB_CONCURRENCY", None)
+            with self.assertRaises(RuntimeError):
+                _assert_single_gunicorn_worker()
+
+    def test_equals_syntax_multiple_workers_raises(self):
+        from stocks.apps import _assert_single_gunicorn_worker
+
+        argv = ["gunicorn", "config.wsgi:application", "--workers=3"]
+        with patch("sys.argv", argv), patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("WEB_CONCURRENCY", None)
+            with self.assertRaises(RuntimeError):
+                _assert_single_gunicorn_worker()
+
+    def test_web_concurrency_env_var_overrides_and_raises(self):
+        """WEB_CONCURRENCY is gunicorn's own override, and takes priority — a
+        `--workers 1` flag with WEB_CONCURRENCY=3 set must still be caught."""
+        from stocks.apps import _assert_single_gunicorn_worker
+
+        argv = ["gunicorn", "config.wsgi:application", "--workers", "1"]
+        with patch("sys.argv", argv), patch.dict("os.environ", {"WEB_CONCURRENCY": "3"}):
+            with self.assertRaises(RuntimeError):
+                _assert_single_gunicorn_worker()
+
+    def test_no_workers_flag_defaults_to_one_and_passes(self):
+        """Absence of --workers must not be treated as unbounded/unknown — gunicorn's
+        own default is 1, so this must not raise."""
+        from stocks.apps import _assert_single_gunicorn_worker
+
+        argv = ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000"]
+        with patch("sys.argv", argv), patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("WEB_CONCURRENCY", None)
+            _assert_single_gunicorn_worker()  # must not raise
+
+
+class RegimeGatingFailClosedTests(TestCase):
+    """
+    Audit fix H11: "Compression Breakout"/"Compression Breakdown" (intraday_service's
+    Trigger 4) were never added to MOMENTUM_STRATEGIES/MEAN_REVERSION_STRATEGIES, and
+    strategy_allowed()'s fallback was `return True` — so that whole trigger family
+    bypassed regime gating entirely, firing regardless of market state. Now classified
+    as momentum, and the fallback fails closed instead of open.
+    """
+
+    def test_compression_breakout_is_gated_as_momentum(self):
+        from stocks.services.shared.regime import strategy_allowed, RegimeState
+
+        allow = RegimeState(allow_momentum=True, allow_mean_reversion=False)
+        block = RegimeState(allow_momentum=False, allow_mean_reversion=True)
+
+        self.assertTrue(strategy_allowed("Compression Breakout", allow))
+        self.assertFalse(strategy_allowed("Compression Breakout", block))
+        self.assertTrue(strategy_allowed("Compression Breakdown", allow))
+        self.assertFalse(strategy_allowed("Compression Breakdown", block))
+
+    def test_unclassified_trigger_fails_closed_not_open(self):
+        """The bug class itself: an unregistered trigger name must be blocked, not
+        silently ungated, regardless of what the regime otherwise permits."""
+        from stocks.services.shared.regime import strategy_allowed, RegimeState
+
+        wide_open = RegimeState(allow_momentum=True, allow_mean_reversion=True)
+        self.assertFalse(strategy_allowed("Some Future Trigger Nobody Classified", wide_open))
+
+    def test_swing_unclassified_family_fails_closed_not_open(self):
+        """Same fail-open trap existed in swing_signals.strategy_allowed too."""
+        from stocks.services import swing_signals
+
+        class WideOpenRegime:
+            allow_momentum = True
+            allow_mean_reversion = True
+
+        self.assertFalse(swing_signals.strategy_allowed("SOME_UNKNOWN_FAMILY", WideOpenRegime()))
+
+
+class ResetStrategyAtomicityTests(TestCase):
+    """
+    Audit fix H5: Reset Strategy used to cancel the existing specialist book, then
+    separately try to rebuild it with no atomicity between the two steps — a scan
+    failure partway through (or a total scan failure) left the account flat with its
+    hedge already cancelled and nothing to replace it. Now the network-heavy pre-scan
+    runs BEFORE anything is cancelled, and the cancel+recreate DB writes happen
+    together in one transaction.
+    """
+
+    def setUp(self):
+        from django.contrib.auth import get_user_model
+        self.user = get_user_model().objects.create_user(
+            username="reset_test_user", password="x", is_temporary=False,
+        )
+
+    def _existing_specialist_signal(self, symbol="OLDSYM"):
+        return SignalHistory.objects.create(
+            symbol=symbol, signal_type="STRANGLE", entry_price=100.0,
+            target=0, stop_loss=0, status=SignalHistory.Status.ACTIVE,
+            category="specialist", metadata={"legs": []},
+        )
+
+    def test_zero_candidates_leaves_existing_signals_untouched(self):
+        """Pre-scan finding nothing viable must NOT cancel the existing book."""
+        from rest_framework.test import APIClient
+
+        existing = self._existing_specialist_signal()
+
+        client = APIClient()
+        client.force_authenticate(user=self.user)
+        # Patching NIFTY_50_STOCKS to an empty list makes the pre-scan produce zero
+        # candidates without needing to mock the whole quote/leg-building pipeline.
+        with patch("stocks.services.delta_hedge_service.NIFTY_50_STOCKS", return_value=[]), \
+             patch("stocks.services.delta_hedge_service.ENTRY_WINDOW_START", time(0, 0)), \
+             patch("stocks.services.delta_hedge_service.ENTRY_WINDOW_END", time(23, 59)):
+            response = client.post("/api/stocks/delta-hedge/")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.data.get("cancelled"), 0)
+        existing.refresh_from_db()
+        self.assertEqual(
+            existing.status, SignalHistory.Status.ACTIVE,
+            "Existing signal must be left untouched when nothing viable was built",
+        )
+
+    def test_temporary_account_still_blocked(self):
+        """Sanity check: the is_temporary block (C9) must survive the H5 restructure."""
+        from django.contrib.auth import get_user_model
+        from rest_framework.test import APIClient
+
+        guest = get_user_model().objects.create_user(
+            username="guest_test_user", password="x", is_temporary=True,
+        )
+        client = APIClient()
+        client.force_authenticate(user=guest)
+        response = client.post("/api/stocks/delta-hedge/")
+
+        self.assertEqual(response.status_code, 403)
+
+
+class LotSizeFallbackTests(TestCase):
+    """
+    Audit fix H18: a failed lot-size lookup used to silently substitute 1 share
+    (wrong by 50-1000x+ for almost every real NSE lot size), corrupting target/SL
+    and credit math without anything logging it. get_lot_size() now returns 0 (an
+    unmistakable "unknown" sentinel) instead, and every caller either aborts
+    (new-signal generation) or falls back to its own previously known-good value
+    (existing-position P&L refresh) rather than trading on a fabricated number.
+    """
+
+    def test_get_lot_size_returns_zero_not_one_when_unresolvable(self):
+        from stocks.services.delta_hedge_service import get_lot_size
+
+        with patch("stocks.services.delta_hedge_service.get_truedata_instance", return_value=None):
+            self.assertEqual(get_lot_size("SOME_RANDOM_STOCK", "NSE"), 0)
+
+    def test_get_lot_size_still_resolves_index_fallbacks(self):
+        """Sanity check: the fix must not break the legitimate index fallback path."""
+        from stocks.services.delta_hedge_service import get_lot_size
+
+        with patch("stocks.services.delta_hedge_service.get_truedata_instance", return_value=None):
+            self.assertEqual(get_lot_size("NIFTY", "NSE"), 50)
+            self.assertEqual(get_lot_size("BANKNIFTY", "NSE"), 15)
+
+    def test_build_specialist_hedge_aborts_when_lot_size_unresolvable(self):
+        from stocks.services.delta_hedge_service import build_specialist_hedge
+
+        orch = MagicMock()
+        with patch("stocks.services.delta_hedge_service.get_lot_size", return_value=0):
+            res = build_specialist_hedge("SOME_STOCK", "NFO", 1000.0, orch)
+
+        self.assertEqual(res, [], "Must abort strangle build rather than price legs off a fake lot size")
+
+    def test_compute_target_sl_returns_sentinel_when_lot_size_unresolvable(self):
+        """(0.0, 0.0) sentinel — the caller's existing `target <= entry_premium`
+        viability check already discards this, so no downstream change was needed."""
+        from stocks.services.option_buying_service import _compute_target_sl
+
+        with patch("stocks.services.delta_hedge_service.get_lot_size", return_value=0):
+            target, sl = _compute_target_sl("SOME_STOCK", entry_premium=25.0)
+
+        self.assertEqual((target, sl), (0.0, 0.0))
+        # Confirm the existing downstream guard really would discard this candidate.
+        entry_premium = 25.0
+        self.assertTrue(target <= entry_premium or sl >= entry_premium or sl <= 0)
+
+    def test_compute_target_sl_unaffected_when_lot_size_resolves(self):
+        """Sanity check: the fix must not change the happy-path target/SL math."""
+        from stocks.services.option_buying_service import _compute_target_sl
+
+        with patch("stocks.services.delta_hedge_service.get_lot_size", return_value=500):
+            target, sl = _compute_target_sl("SOME_STOCK", entry_premium=25.0)
+
+        self.assertGreater(target, 25.0)
+        self.assertLess(sl, 25.0)
+        self.assertGreater(sl, 0.0)
 
 
 class AssignmentRiskFlagTests(TestCase):
@@ -1184,26 +1620,35 @@ class OptionBuyingDailyLossHaltTests(TestCase):
     def tearDown(self):
         self.cache.delete(self.halt_key)
 
-    def _closed_signal(self, symbol, entry, exit_price, status, strike=100.0, option_type="CE"):
+    def _closed_signal(self, symbol, entry, exit_price, status, strike=100.0, option_type="CE",
+                        generated_at=None):
         from stocks.models import SignalHistory as SH
-        return SH.objects.create(
+        sig = SH.objects.create(
             symbol=symbol, signal_type="BUY_CE", category="option_buying",
             entry_price=entry, stop_loss=entry * 0.5, target=entry * 2.0, rr=2.0,
             status=status, reason="test", exit_price=exit_price,
             strike_price=strike, option_type=option_type,
         )
+        if generated_at is not None:
+            # Fixed generated_at instead of auto_now_add's real "now" — Django's
+            # generated_at__date lookup evaluates in settings.TIME_ZONE (UTC), so a
+            # test using real wall-clock IST "now" is flaky for ~5.5h/day (IST
+            # 00:00-05:30, when the IST and UTC calendar dates disagree). Picking a
+            # fixed mid-day IST moment keeps both dates in agreement regardless of
+            # when the suite actually runs.
+            SH.objects.filter(pk=sig.pk).update(generated_at=generated_at)
+        return sig
 
     @patch("stocks.services.delta_hedge_service.get_lot_size", return_value=50)
     def test_c2_halt_arms_from_closed_rows_with_empty_active_book(self, mock_lot_size):
         """A day of stopped-out option_buying trades (nothing ACTIVE) must still arm
-        the halt — same empty-book scenario as C1's intraday fix. Uses real "now" for
-        both generated_at (auto_now_add) and the check itself, so no date faking is
-        needed for the generated_at__date=today match."""
-        from django.utils import timezone as dj_timezone
+        the halt — same empty-book scenario as C1's intraday fix."""
         from stocks.services.option_buying_service import (
             _enforce_option_buying_daily_loss_limit, OPTION_BUYING_DAILY_HALT_CACHE_KEY,
         )
         from stocks.services.intraday_service import INTRADAY_ACCOUNT_EQUITY
+
+        now_ist = datetime(2026, 4, 1, 13, 15, tzinfo=IST)
 
         # 2-lot P&L per Re.1 move = lot_size(50)*2 = 100. Loss of Rs.3/premium * 100 =
         # Rs.300 per trade; enough trades to clear the 2% limit regardless of its value.
@@ -1211,9 +1656,9 @@ class OptionBuyingDailyLossHaltTests(TestCase):
         per_trade_loss = 3.0 * 100
         n = int(limit // per_trade_loss) + 2
         for i in range(n):
-            self._closed_signal(f"SYM{i}", entry=50.0, exit_price=47.0, status=SignalHistory.Status.HIT_SL)
+            self._closed_signal(f"SYM{i}", entry=50.0, exit_price=47.0,
+                                 status=SignalHistory.Status.HIT_SL, generated_at=now_ist)
 
-        now_ist = dj_timezone.now().astimezone(IST)
         halted = _enforce_option_buying_daily_loss_limit(now_ist)
 
         self.assertTrue(halted)

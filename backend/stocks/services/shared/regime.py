@@ -49,8 +49,14 @@ INDIA_VIX_TOKEN = "INDIA VIX"  # optional; model degrades gracefully if unavaila
 
 # Trigger families. Momentum setups need trend + expanding vol; mean reversion needs
 # range + contracting vol. This mapping is what actually gates signal generation.
+# Audit fix H11: "Compression Breakout"/"Compression Breakdown" (intraday_service.py's
+# Trigger 4 — volatility-compression breakout continuation, same directional-breakout
+# shape as POC Flip / VA Breakout) were missing from this set entirely, so
+# strategy_allowed()'s old fail-open default let the whole trigger family bypass
+# regime gating regardless of market state.
 MOMENTUM_STRATEGIES = {"POC Bullish Flip", "POC Bearish Flip",
-                       "Value Area Bullish Breakout", "Value Area Bearish Breakdown"}
+                       "Value Area Bullish Breakout", "Value Area Bearish Breakdown",
+                       "Compression Breakout", "Compression Breakdown"}
 MEAN_REVERSION_STRATEGIES = {"Value Area Low Rejection", "Value Area High Rejection"}
 
 
@@ -374,9 +380,24 @@ def get_regime(svc=None, use_cache: bool = True, profile=None) -> RegimeState:
 
 
 def strategy_allowed(strategy_reason: str, regime: RegimeState) -> bool:
-    """Is this trigger family permitted in the current regime?"""
+    """Is this trigger family permitted in the current regime?
+
+    Audit fix H11: the fallback used to be `return True` — any trigger name not yet
+    added to MOMENTUM_STRATEGIES/MEAN_REVERSION_STRATEGIES silently bypassed regime
+    gating entirely rather than failing safe (this is exactly how "Compression
+    Breakout"/"Compression Breakdown" went ungated for however long they existed
+    before being added above). Fails closed instead: an unclassified trigger is
+    blocked, loudly, rather than silently ungated — a missing classification now
+    shows up as "this trigger never fires" instead of "this trigger ignores regime."
+    """
     if strategy_reason in MOMENTUM_STRATEGIES:
         return regime.allow_momentum
     if strategy_reason in MEAN_REVERSION_STRATEGIES:
         return regime.allow_mean_reversion
-    return True
+    logger.warning(
+        "[REGIME] Unclassified trigger '%s' is not in MOMENTUM_STRATEGIES or "
+        "MEAN_REVERSION_STRATEGIES — blocking by default instead of bypassing "
+        "regime gating. Add it to the correct set in shared/regime.py.",
+        strategy_reason,
+    )
+    return False

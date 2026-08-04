@@ -21,12 +21,14 @@ NOTE: these tests require `django.setup()` (all three modules under test import 
 models/settings at module scope) and this repo's `StocksConfig.ready()` logs into the
 live TrueData session as a side effect UNLESS `'test' in sys.argv` (see
 `stocks/apps.py`) — which is exactly the guard Django's own `manage.py test` / test
-runner trips, and exactly what running these via ad hoc `python`/`pytest` outside that
-runner would not trip. Per repo convention (see `OptionGreeksServiceTests` in
-`tests.py`, cited in AUDIT_REMEDIATION_PLAN.md as "3 new unit tests (unrun — require
-django.setup() — verified by hand-tracing)"), these were NOT executed in this session;
-every fixture and formula below was hand-traced against the real implementations to
-confirm correctness before being committed here.
+runner trips.
+
+Audit fix H16: this file was originally committed hand-traced but never actually
+executed (see AUDIT_REMEDIATION_PLAN.md Phase 5 item B and the matching caveat that
+used to be here). Run for real via `manage.py test stocks.tests_phase5b_regression` —
+all 6 pass. It's picked up automatically by `manage.py test stocks` (Django's default
+discovery matches any `test*.py` module) and by the CI workflow (Phase 3 #3.4.1), so it
+runs on every push going forward; no special invocation is needed.
 """
 from unittest.mock import MagicMock, patch
 

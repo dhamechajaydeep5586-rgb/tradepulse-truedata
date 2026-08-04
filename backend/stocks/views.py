@@ -277,7 +277,20 @@ class DeltaHedgeView(APIView):
             })
 
     def post(self, request):
-        """Reset Strategy: cancel all today's signals and immediately spawn fresh ones."""
+        """Reset Strategy: cancel all today's signals and immediately spawn fresh ones.
+
+        Audit fix H5: this used to cancel the existing book FIRST, then separately try
+        to rebuild it with no atomicity between the two — a scan failure partway through
+        (or even a total scan failure) left the account flat with its hedge already
+        cancelled and nothing to replace it, no automatic retry. Restructured into two
+        phases: (1) a pre-scan that does all the slow network I/O (quotes, option
+        chains) and builds candidate legs WITHOUT touching any existing signal; (2) a
+        single DB transaction that cancels the old book and creates the new one
+        together, only entered once phase 1 has confirmed there's something to create.
+        If phase 1 finds nothing viable, the existing signals are left untouched and an
+        error is returned instead of silently leaving the account unhedged.
+        """
+        from django.db import transaction
         from stocks.models import SignalHistory
         from django.core.cache import cache
         from django.utils import timezone
@@ -294,39 +307,12 @@ class DeltaHedgeView(APIView):
             return Response({"error": "This action is not available on a temporary account."}, status=403)
 
         today = timezone.now().date()
-
-        # 1. Cancel all today's active/pending specialist signals
-        cancelled = SignalHistory.objects.filter(
-            category='specialist',
-            status__in=[SignalHistory.Status.ACTIVE, SignalHistory.Status.PENDING],
-            generated_at__date=today
-        ).update(status=SignalHistory.Status.CANCELLED)
-        logger.info("[RESET] Cancelled %d today's specialist signals", cancelled)
-
-        # 2. Also expire ALL stale signals from previous days (prevents unique constraint block)
         from stocks.services.signal_utils import IST
         today_start = timezone.now().astimezone(IST).replace(hour=0, minute=0, second=0, microsecond=0)
-        stale = SignalHistory.objects.filter(
-            category='specialist',
-            status__in=[SignalHistory.Status.ACTIVE, SignalHistory.Status.PENDING],
-            generated_at__lt=today_start
-        ).update(status=SignalHistory.Status.EXPIRED)
-        if stale:
-            logger.info("[RESET] Expired %d stale signals from previous days", stale)
 
-        # 3. Clear ALL relevant caches so the panel and scanner start fresh
-        for key in [
-            "delta_hedge_panel_2s",
-            "delta_hedge_panel_live_5s",
-            "delta_hedge_panel_60s",
-            "delta_hedge_scanner_throttle_5m",
-            "stale_signal_cleanup_done",
-        ]:
-            cache.delete(key)
-
-        # 4. Immediately run a synchronous mini-scan to create fresh signals right now
-        #    so the next panel fetch (in ~3s) shows actual signals instead of empty.
-        created_count = 0
+        # ── Phase 1: pre-scan candidates & build legs (network I/O — stays OUTSIDE any
+        # DB transaction, and deliberately runs BEFORE any existing signal is touched).
+        built = []  # list of (cand, spot, legs)
         try:
             from stocks.services.delta_hedge_service import (
                 NIFTY_50_STOCKS, DEFAULT_STOCK_SIGMA,
@@ -376,32 +362,75 @@ class DeltaHedgeView(APIView):
                     legs = build_specialist_hedge(cand['symbol'], cand['exchange'], spot, orch, sigma=cand['sigma'])
                     if not legs:
                         continue
-                    # Guard: don't create if one already exists for today
-                    exists = SignalHistory.objects.filter(
-                        symbol=cand['symbol'], category='specialist',
-                        status__in=[SignalHistory.Status.PENDING, SignalHistory.Status.ACTIVE],
-                        generated_at__gte=today_start
-                    ).exists()
-                    if exists:
-                        continue
-                    SignalHistory.objects.create(
-                        symbol=cand['symbol'], signal_type='STRANGLE',
-                        entry_price=spot, target=0, stop_loss=0,
-                        status=SignalHistory.Status.PENDING,
-                        category='specialist',
-                        metadata={'legs': legs, 'confidence': cand.get('confidence', 0), 'rank': i + 1}
-                    )
-                    created_count += 1
-                    logger.info("[RESET] Created signal for %s spot=%.2f legs=%d",
-                                cand['symbol'], spot, len(legs))
+                    built.append((cand, spot, legs, i))
                 except Exception as ce:
-                    logger.error("[RESET] Failed to create signal for %s: %s", cand.get('symbol'), ce)
+                    logger.error("[RESET] Failed to build candidate for %s: %s", cand.get('symbol'), ce)
 
         except Exception as scan_err:
-            logger.error("[RESET] Immediate scan failed: %s", scan_err)
+            logger.error("[RESET] Pre-scan failed: %s", scan_err)
 
-        # 5. Set scanner throttle AFTER we've just run, so the background scanner
-        #    doesn't run again immediately and overwrite our fresh signals.
+        if not built:
+            logger.error("[RESET] Pre-scan produced zero viable candidates — leaving existing signals untouched.")
+            return Response({
+                "error": "Could not build any new strangle candidates — existing signals were left untouched.",
+                "cancelled": 0,
+                "created": 0,
+            }, status=503)
+
+        # ── Phase 2: DB writes, atomic. Either the whole cancel+recreate lands
+        # together, or (on any DB-level exception) none of it does — no more
+        # half-cancelled, half-rebuilt state.
+        with transaction.atomic():
+            cancelled = SignalHistory.objects.filter(
+                category='specialist',
+                status__in=[SignalHistory.Status.ACTIVE, SignalHistory.Status.PENDING],
+                generated_at__date=today
+            ).update(status=SignalHistory.Status.CANCELLED)
+            logger.info("[RESET] Cancelled %d today's specialist signals", cancelled)
+
+            stale = SignalHistory.objects.filter(
+                category='specialist',
+                status__in=[SignalHistory.Status.ACTIVE, SignalHistory.Status.PENDING],
+                generated_at__lt=today_start
+            ).update(status=SignalHistory.Status.EXPIRED)
+            if stale:
+                logger.info("[RESET] Expired %d stale signals from previous days", stale)
+
+            created_count = 0
+            for cand, spot, legs, i in built:
+                # Guard: don't create if one already exists for today. Valid again now
+                # that the cancel above ran first in this same transaction — Django
+                # sees that write when this query runs.
+                exists = SignalHistory.objects.filter(
+                    symbol=cand['symbol'], category='specialist',
+                    status__in=[SignalHistory.Status.PENDING, SignalHistory.Status.ACTIVE],
+                    generated_at__gte=today_start
+                ).exists()
+                if exists:
+                    continue
+                SignalHistory.objects.create(
+                    symbol=cand['symbol'], signal_type='STRANGLE',
+                    entry_price=spot, target=0, stop_loss=0,
+                    status=SignalHistory.Status.PENDING,
+                    category='specialist',
+                    metadata={'legs': legs, 'confidence': cand.get('confidence', 0), 'rank': i + 1}
+                )
+                created_count += 1
+                logger.info("[RESET] Created signal for %s spot=%.2f legs=%d",
+                            cand['symbol'], spot, len(legs))
+
+        # Clear ALL relevant caches so the panel and scanner reflect the fresh state.
+        for key in [
+            "delta_hedge_panel_2s",
+            "delta_hedge_panel_live_5s",
+            "delta_hedge_panel_60s",
+            "delta_hedge_scanner_throttle_5m",
+            "stale_signal_cleanup_done",
+        ]:
+            cache.delete(key)
+
+        # Set scanner throttle AFTER we've just run, so the background scanner
+        # doesn't run again immediately and overwrite our fresh signals.
         cache.set("delta_hedge_scanner_throttle_5m", True, timeout=120)
 
         return Response({

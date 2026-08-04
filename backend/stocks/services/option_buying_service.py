@@ -171,6 +171,12 @@ def _compute_target_sl(symbol: str, entry_premium: float) -> tuple[float, float]
     how large a move that requires for this particular stock's premium."""
     from stocks.services.delta_hedge_service import get_lot_size
     lot_size = get_lot_size(symbol, "NSE")
+    if lot_size <= 0:
+        # Audit fix H18: get_lot_size() now returns 0 (not a fabricated 1) when it
+        # can't resolve a real lot size. (0.0, 0.0) is a sentinel the caller's
+        # existing `target <= entry_premium` viability check already discards —
+        # avoids both a ZeroDivisionError and trading on a fake target/SL.
+        return 0.0, 0.0
     per_rupee_move = lot_size * 2  # 2-lot P&L per Re.1 of premium move
     profit_move = OPTION_BUYING_PROFIT_RUPEES / per_rupee_move
     loss_move = OPTION_BUYING_LOSS_RUPEES / per_rupee_move
@@ -240,7 +246,14 @@ def _enforce_option_buying_daily_loss_limit(now_ist: datetime) -> bool:
         entry = float(s.entry_price)
         # Same 2-lot convention as _compute_target_sl — buying CE or PE is always a
         # long-premium trade, so P&L direction is always +1 (profit when premium rises).
-        per_rupee_move = get_lot_size(s.symbol, "NSE") * 2
+        lot_size = get_lot_size(s.symbol, "NSE")
+        if lot_size <= 0:
+            # Audit fix H18: an unresolved lot size must not silently zero out this
+            # row's contribution to the daily P&L sum (0 * anything = 0, understating
+            # a real loss right when the kill switch most needs an accurate total).
+            logger.warning("[OPTION_BUYING][KILL_SWITCH] Skipping %s in daily P&L sum — no real lot size resolved.", s.symbol)
+            continue
+        per_rupee_move = lot_size * 2
         if s.status in closed and s.exit_price is not None:
             total += (float(s.exit_price) - entry) * per_rupee_move
         elif s.status == SignalHistory.Status.ACTIVE and s.premium_cmp is not None:
