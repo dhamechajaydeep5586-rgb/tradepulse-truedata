@@ -19,7 +19,7 @@ import sys
 import time
 import django
 
-sys.path.insert(0, "/home/jd/tradeplusai/tradepulse-ai/backend")
+sys.path.insert(0, "/home/jd/tradepulse-truedata/backend")
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 django.setup()
 

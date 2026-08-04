@@ -21,6 +21,19 @@ INTRADAY_PROFIT_CAPTURE_EARLY = 0.20 # Very fast exit: 20% decay if DTE ≤ 3 (g
 SHORT_DELTA_DANGER = 0.55            # Critical delta — auto-exit strangle
 AUTO_EXIT_ON_DELTA_BREACH = True
 
+# Audit fix (C4): NSE stock options (unlike index options) are American-style and
+# physically settled — a short leg that drifts/gaps ITM can be assigned before
+# expiry, obligating physical delivery rather than a cash settlement. This threshold
+# is deliberately BELOW SHORT_DELTA_DANGER: it's an early informational warning
+# specific to physically-settled stock legs, not an auto-exit trigger — the strangle
+# engine has no code path that distinguishes stock-option risk from index-option risk
+# otherwise.
+ASSIGNMENT_RISK_DELTA = 0.35
+# Index underlyings settle in cash (no physical-delivery/assignment risk at all) —
+# same set truedata_service.get_option_chain() classifies as OPTIDX. Everything else
+# this engine trades is a single-stock underlying, i.e. OPTSTK.
+INDEX_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
+
 # ─────────────────────────────────────────────────────────────
 # 4. EXPIRY / GAMMA MANAGEMENT
 # ─────────────────────────────────────────────────────────────

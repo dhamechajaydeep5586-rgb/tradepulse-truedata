@@ -29,6 +29,7 @@ from stocks.services.config_vol import (
     INTRADAY_MIN_PREMIUM_MORNING, INTRADAY_MIN_PREMIUM_MIDDAY,
     INTRADAY_MIN_PREMIUM_AFTERNOON,
     INTRADAY_PREMIUM_ASYMMETRY_TOLERANCE, MIN_INTRADAY_THETA_VELOCITY,
+    ASSIGNMENT_RISK_DELTA, INDEX_UNDERLYINGS,
 )
 from stocks.services.risk_state_engine import classify_risk_state, RiskState
 from stocks.services.vol_telegram_formatter import format_entry_signal, format_live_update
@@ -274,6 +275,16 @@ def score_intraday_theta_velocity(theta: float, spot: float, strike: float) -> f
     if otm_pct <= 0:
         return 0.0
     return round(abs(theta) / otm_pct, 6)
+
+def is_physical_settlement_risk(symbol: str, max_short_delta: float) -> bool:
+    """True if `symbol` is a single-stock underlying (American-style, physically
+    settled per SEBI mandate since 2019, unlike cash-settled index options) AND a
+    short leg's delta has climbed to ASSIGNMENT_RISK_DELTA — an early, informational
+    warning distinct from (and below) SHORT_DELTA_DANGER's auto-exit threshold.
+    Audit fix C4: nothing previously distinguished stock-option assignment risk from
+    index-option risk anywhere in this engine."""
+    return symbol not in INDEX_UNDERLYINGS and max_short_delta >= ASSIGNMENT_RISK_DELTA
+
 
 def get_lot_size(symbol: str, exchange: str) -> int:
     """Fetch lot size dynamically from the option chain (nearest expiry)."""
@@ -590,6 +601,21 @@ def build_specialist_hedge(symbol: str, exchange: str, spot_price: float, orch, 
     Each of the above relies on a price/delta check firing and an exit order
     executing before the underlying gaps further, so slippage/gap risk on the exit
     itself is real and unbounded loss is not merely theoretical on a large enough move.
+
+    ASSIGNMENT / PHYSICAL-SETTLEMENT RISK (audit fix C4): for a single-stock
+    underlying (`symbol` not in config_vol.INDEX_UNDERLYINGS), the resulting short
+    legs are NSE stock options — American-style and physically settled (SEBI mandate
+    since 2019), unlike index options. A short leg that drifts or gaps ITM can be
+    assigned before expiry, obligating physical delivery of the underlying rather
+    than a cash settlement — a materially different (and potentially much larger)
+    obligation than the premium collected. Nothing in this file distinguishes
+    stock-option risk from index-option risk beyond the informational
+    `assignment_risk` flag set on each leg during the audit loop
+    (ASSIGNMENT_RISK_DELTA in config_vol.py) — that flag does NOT auto-exit the
+    position, it only surfaces the warning. Trading this strategy on single-stock
+    underlyings carries real assignment risk that the account owner must manage
+    manually; this is disclosed here and in DeltaHedgePanel's UI copy rather than
+    silently handled.
     """
     legs = []
     lot_size = get_lot_size(symbol, exchange)
@@ -1369,6 +1395,11 @@ def build_specialist_hedge(symbol: str, exchange: str, spot_price: float, orch, 
             'option_type': side,
             'token': token,
             'action': action,
+            # Audit fix (C4): NSE stock options are American-style / physically
+            # settled, unlike index options — see ASSIGNMENT_RISK_DELTA in
+            # config_vol.py. Recorded at leg build time since it only depends on
+            # the underlying, not price.
+            'instrument_type': 'OPTIDX' if symbol in INDEX_UNDERLYINGS else 'OPTSTK',
             'lots': -1 if action == 'SELL' else 1,
             'lot_size': lot_size,
             'delta': greeks['delta'],
@@ -2681,7 +2712,22 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
                         ce_delta = abs(float(ce_leg.get('delta', 0.0) or 0.0))
                         pe_delta = abs(float(pe_leg.get('delta', 0.0) or 0.0))
                         max_short_delta = max(ce_delta, pe_delta)
-                        
+
+                        # Audit fix (C4): physical-settlement/assignment-risk warning,
+                        # distinct from and earlier than the delta-danger auto-exit
+                        # below — informational only, does not itself close the
+                        # position. Index legs (cash-settled) never carry this risk.
+                        assignment_risk = is_physical_settlement_risk(sig.symbol, max_short_delta)
+                        section['assignment_risk'] = assignment_risk
+                        sig.metadata['assignment_risk'] = assignment_risk
+                        if assignment_risk:
+                            logger.warning(
+                                "[ASSIGNMENT_RISK] %s is a physically-settled stock option nearing ITM "
+                                "(delta=%.2f) — a short leg that drifts/gaps ITM before expiry can be "
+                                "assigned, obligating physical delivery rather than cash settlement.",
+                                sig.symbol, max_short_delta,
+                            )
+
                         # Classify dynamic risk state
                         risk_state = classify_risk_state(premium_expansion_pct, max_short_delta)
                         section['risk_state'] = risk_state.value

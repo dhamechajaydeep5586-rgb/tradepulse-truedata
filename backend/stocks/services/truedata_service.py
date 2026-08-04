@@ -126,6 +126,17 @@ class TrueDataService:
 
             from stocks.services.signal_utils import is_static_closed
             if not is_static_closed("NSE"):
+                # authenticate() re-runs every ~3.9h on token near-expiry, on the one
+                # long-lived worker process this app runs as. Without stopping the
+                # previous streamer first, every refresh orphans its socket and both
+                # background threads — a zombie whose health monitor keeps retrying
+                # forever, contending for TrueData's single allowed WS session per
+                # login. Mirrors the existing disconnect() cleanup below.
+                if self.streamer:
+                    try:
+                        self.streamer.stop()
+                    except Exception as e:
+                        logger.warning("[TRUEDATA] Error stopping previous streamer before reconnect: %s", e)
                 self.streamer = TrueDataStreamer(self.username, self.password, self.ws_port, restart_lock=self._restart_lock)
                 self.streamer.start()
 
@@ -230,6 +241,13 @@ class TrueDataService:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
 
+            # A malformed source row (e.g. a non-numeric field) coerces to NaN above
+            # rather than raising — Postgres accepts NaN silently, so an un-dropped row
+            # here permanently corrupts the candle store. Drop before caching/returning.
+            ohlcv_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            if ohlcv_cols:
+                df = df.dropna(subset=ohlcv_cols)
+
             if cache_key:
                 _dj_cache.set(cache_key, df, timeout=240)
             return df
@@ -260,7 +278,15 @@ class TrueDataService:
                     age = time.time() - tick.get("fetch_time", 0)
                     is_ws = tick.get("source") == "websocket"
                     has_ohlc = tick.get("high", 0) > 0 and tick.get("low", 0) > 0
-                    if (is_ws or age < 30) and (mode != "FULL" or has_ohlc):
+                    # A tick's age is checked regardless of source — a WS-sourced cache
+                    # entry from a silently-dead socket must expire and fall through to
+                    # the REST path below, not be trusted forever just because it once
+                    # came from the WebSocket. WS gets a longer bound (streaming ticks
+                    # are pushed continuously so a fresh one is rarely far behind) than a
+                    # REST-fetched one (fetched on-demand, so staleness there means the
+                    # fetch itself is old).
+                    fresh_bound = 60 if is_ws else 30
+                    if age < fresh_bound and (mode != "FULL" or has_ohlc):
                         is_fresh = True
                 if is_fresh:
                     results[f"{exchange}:{symbol}"] = tick
@@ -291,31 +317,39 @@ class TrueDataService:
                 return results
 
             if response.status_code == 200:
-                reader = csv.DictReader(io.StringIO(response.text.strip()))
-                exch_by_symbol = {s: e for e, s in to_fetch}
-                for row in reader:
-                    symbol = row.get("symbol") or row.get("Symbol")
-                    if not symbol:
-                        continue
-                    ltp = float(row.get("ltp") or row.get("LTP") or 0)
-                    if ltp <= 0:
-                        continue
-                    exchange = exch_by_symbol.get(symbol, "NSE")
-                    tick = {
-                        "ltp": ltp,
-                        "high": float(row.get("high", 0) or 0),
-                        "low": float(row.get("low", 0) or 0),
-                        "close": float(row.get("close", 0) or row.get("prevclose", 0) or 0),
-                        "change": float(row.get("change", 0) or 0),
-                        "change_percent": float(row.get("changeper", 0) or row.get("change_percent", 0) or 0),
-                        "trade_volume": float(row.get("volume", 0) or 0),
-                        "open_interest": float(row.get("oi", 0) or 0),
-                        "source": "rest_fallback",
-                        "fetch_time": time.time(),
-                    }
-                    results[f"{exchange}:{symbol}"] = tick
-                    with _STREAM_LOCK:
-                        _STREAM_CACHE[symbol] = tick
+                # getLTPBulk's CSV has no symbol column — rows come back in request
+                # order only, so they must be paired to `to_fetch` by position. A
+                # short or reordered response with no length check silently shifts
+                # every subsequent pairing, misattributing prices for the rest of the
+                # batch with nothing logged. Validate row count first; abort (and log)
+                # the whole batch on any mismatch instead of guessing a partial pairing.
+                rows = list(csv.DictReader(io.StringIO(response.text.strip())))
+                if len(rows) != len(to_fetch):
+                    logger.error(
+                        "[TRUEDATA] BULK_QUOTE_ROW_MISMATCH requested=%d got=%d — "
+                        "aborting batch, refusing to pair by guesswork.",
+                        len(to_fetch), len(rows),
+                    )
+                else:
+                    for (exchange, symbol), row in zip(to_fetch, rows):
+                        ltp = float(row.get("ltp") or row.get("LTP") or 0)
+                        if ltp <= 0:
+                            continue
+                        tick = {
+                            "ltp": ltp,
+                            "high": float(row.get("high", 0) or 0),
+                            "low": float(row.get("low", 0) or 0),
+                            "close": float(row.get("close", 0) or row.get("prevclose", 0) or 0),
+                            "change": float(row.get("change", 0) or 0),
+                            "change_percent": float(row.get("changeper", 0) or row.get("change_percent", 0) or 0),
+                            "trade_volume": float(row.get("volume", 0) or 0),
+                            "open_interest": float(row.get("oi", 0) or 0),
+                            "source": "rest_fallback",
+                            "fetch_time": time.time(),
+                        }
+                        results[f"{exchange}:{symbol}"] = tick
+                        with _STREAM_LOCK:
+                            _STREAM_CACHE[symbol] = tick
             else:
                 logger.warning("[TRUEDATA] BULK_QUOTE_HTTP_ERROR status=%s", response.status_code)
         except Exception as e:

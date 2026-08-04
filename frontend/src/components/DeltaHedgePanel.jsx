@@ -3,6 +3,11 @@ import axios from '../api/axios';
 import { useAuth } from '../context/AuthContext';
 import useSignalNotification from '../hooks/useSignalNotification';
 
+// Cash-settled underlyings — matches config_vol.INDEX_UNDERLYINGS on the backend.
+// Everything else this panel shows is a single-stock underlying, i.e. physically
+// settled (audit fix C4).
+const INDEX_UNDERLYINGS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'];
+
 const DeltaHedgePanel = () => {
     const { user } = useAuth();
     const [data, setData] = useState(null);
@@ -113,7 +118,15 @@ const DeltaHedgePanel = () => {
                     <li><span className="text-emerald-400">OTM Selling:</span> Profit from low-probability outcomes.</li>
                     <li><span className={`text-${colorClass}-400`}>Theta Burn:</span> Earn premium while price stays sideways.</li>
                     <li><span className="text-rose-400">Naked / Uncapped Risk:</span> No long-option hedge — a large move against either strike is not capped by an owned option. Managed only by systematic stop-loss and delta-breach auto-exit rules.</li>
+                    {section.underlying && !INDEX_UNDERLYINGS.includes(section.underlying) && (
+                        <li><span className="text-amber-400">Physical Settlement:</span> Single-stock options are American-style and physically settled — a leg that drifts/gaps ITM before expiry can be assigned, requiring physical delivery rather than a cash settlement.</li>
+                    )}
                 </ul>
+                {section.assignment_risk && (
+                    <p className="mt-2 pt-2 border-t border-amber-500/20 text-amber-400 font-semibold">
+                        ⚠ Assignment risk: a short leg is nearing ITM on this physically-settled stock option.
+                    </p>
+                )}
             </div>
         );
     };

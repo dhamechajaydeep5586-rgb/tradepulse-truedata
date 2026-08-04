@@ -42,6 +42,7 @@ one-time bootstrap cost like candle_store's delta-fetch cache.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 
 from django.core.cache import cache
@@ -81,6 +82,15 @@ def roll_up_universe(token_map: dict[str, str], exchange: str = "NSE") -> int:
     for symbol, token in token_map.items():
         tick = get_stream_price(token)
         if not tick or tick.get("ltp", 0) <= 0:
+            continue
+        # A silently-dead WebSocket keeps returning the same frozen cached tick
+        # forever. Without this bound, that stale tick gets folded into the
+        # in-progress bar as if it were live, producing flat, fabricated OHLC
+        # candles persisted into CandleBar as real history. Skip it instead —
+        # the window simply doesn't advance for this symbol until a real tick
+        # arrives.
+        age = time.time() - float(tick.get("fetch_time", 0) or 0)
+        if age > 60:
             continue
         processed += 1
 

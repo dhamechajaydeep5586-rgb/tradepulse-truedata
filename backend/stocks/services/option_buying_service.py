@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, time
 from typing import Any
 
 import pandas as pd
+from django.conf import settings
 
 from stocks.models import SignalHistory
 from stocks.services import candle_store
@@ -35,6 +36,15 @@ CATEGORY = "option_buying"
 # convention already used everywhere else for option buying (telegram_service.py).
 OPTION_BUYING_PROFIT_RUPEES = 5000   # 2-lot profit target
 OPTION_BUYING_LOSS_RUPEES = 2500     # 2-lot stop-loss
+
+# Audit fix (C2): option buying — the platform's most leveraged, fastest-decaying
+# strategy (immediate ACTIVE entry, no PENDING wait, Rs.2,500-5,000 per-trade swings)
+# — had no session-level circuit breaker at all, unlike intraday's
+# DAILY_HALT_CACHE_KEY/_enforce_daily_loss_limit. Same 2% default and same shared
+# account-equity basis as intraday (see INTRADAY_ACCOUNT_EQUITY in intraday_service.py
+# — CLAUDE.md documents it as "the real account size", not an intraday-only figure).
+OPTION_BUYING_DAILY_LOSS_LIMIT_PCT = float(getattr(settings, "OPTION_BUYING_DAILY_LOSS_LIMIT_PCT", 2.0))
+OPTION_BUYING_DAILY_HALT_CACHE_KEY = "option_buying_daily_loss_halt"
 
 
 def _option_breakout_logic(
@@ -205,6 +215,66 @@ def _live_option_buying_payload() -> dict[str, Any]:
     }
 
 
+def _enforce_option_buying_daily_loss_limit(now_ist: datetime) -> bool:
+    """Flatten today's open option_buying positions and halt further generation once
+    the day's realised + unrealised P&L breaches the limit — mirrors
+    live_signal_service._enforce_daily_loss_limit's pattern for intraday (audit
+    finding C2). Returns True if the halt is (now, or already) active.
+    """
+    from stocks.services.delta_hedge_service import get_lot_size
+    from stocks.services.intraday_service import INTRADAY_ACCOUNT_EQUITY
+
+    if cache.get(OPTION_BUYING_DAILY_HALT_CACHE_KEY):
+        return True
+
+    today = now_ist.date()
+    rows = list(SignalHistory.objects.filter(category=CATEGORY, generated_at__date=today))
+    if not rows:
+        return False
+
+    closed = {SignalHistory.Status.HIT_TARGET, SignalHistory.Status.HIT_SL}
+    total = 0.0
+    for s in rows:
+        if s.entry_price is None:
+            continue
+        entry = float(s.entry_price)
+        # Same 2-lot convention as _compute_target_sl — buying CE or PE is always a
+        # long-premium trade, so P&L direction is always +1 (profit when premium rises).
+        per_rupee_move = get_lot_size(s.symbol, "NSE") * 2
+        if s.status in closed and s.exit_price is not None:
+            total += (float(s.exit_price) - entry) * per_rupee_move
+        elif s.status == SignalHistory.Status.ACTIVE and s.premium_cmp is not None:
+            total += (float(s.premium_cmp) - entry) * per_rupee_move
+
+    limit = INTRADAY_ACCOUNT_EQUITY * (OPTION_BUYING_DAILY_LOSS_LIMIT_PCT / 100.0)
+    if total > -limit:
+        return False
+
+    logger.error(
+        "[OPTION_BUYING][KILL_SWITCH] Daily P&L Rs.%.2f breached limit Rs.-%.2f — flattening.",
+        total, limit,
+    )
+
+    for s in rows:
+        if s.status != SignalHistory.Status.ACTIVE:
+            continue
+        entry = float(s.entry_price) if s.entry_price is not None else 0.0
+        exit_px = float(s.premium_cmp) if s.premium_cmp is not None else entry
+        s.status = SignalHistory.Status.HIT_TARGET if exit_px >= entry else SignalHistory.Status.HIT_SL
+        s.exit_price = exit_px
+        s.exit_time = datetime.now(tz=IST)
+        meta = s.metadata or {}
+        meta["exit_reason"] = "DAILY_LOSS_LIMIT"
+        s.metadata = meta
+        s.save(update_fields=["status", "exit_price", "exit_time", "metadata"])
+
+    # Hold the halt until end of day so no later scan reopens positions.
+    eod = now_ist.replace(hour=23, minute=59, second=0, microsecond=0)
+    cache.set(OPTION_BUYING_DAILY_HALT_CACHE_KEY, True,
+              timeout=max(60, int((eod - now_ist).total_seconds())))
+    return True
+
+
 def update_option_buying_outcomes() -> None:
     """
     Self-contained audit loop, mirroring delta_hedge_service's precedent of excluding
@@ -214,26 +284,40 @@ def update_option_buying_outcomes() -> None:
     """
     from stocks.services.truedata_service import get_truedata_instance
 
-    live_rows = SignalHistory.objects.filter(category=CATEGORY, status=SignalHistory.Status.ACTIVE)
-    if not live_rows.exists():
-        return
-
-    svc = get_truedata_instance()
-    if not svc:
-        return
-
     now_ist = datetime.now(tz=IST)
     past_time_stop = now_ist.time() >= OPTION_BUYING_TIME_STOP
 
-    for sig in live_rows:
+    live_rows = SignalHistory.objects.filter(category=CATEGORY, status=SignalHistory.Status.ACTIVE)
+    # The per-signal audit loop below needs a broker handle and a non-empty book, but
+    # the daily loss limit check after it must run regardless (same C1 pattern as
+    # live_signal_service.update_signal_outcomes: an empty book is exactly the state
+    # right after a string of stop-losses closes it, which is precisely when the kill
+    # switch is needed most) — so neither an empty queryset nor a down broker skips it.
+    svc = get_truedata_instance() if live_rows.exists() else None
+    for sig in (live_rows if svc else []):
         try:
             quote = svc.get_option_quote(sig.symbol, float(sig.strike_price), sig.option_type, expiry=sig.option_expiry)
-            if not quote or not quote.get("ltp"):
-                continue
-            current_premium = round_to_tick(float(quote["ltp"]))
             entry_premium = float(sig.entry_price)
             target = float(sig.target) if sig.target else None
             stop_loss = float(sig.stop_loss) if sig.stop_loss else None
+
+            if not quote or not quote.get("ltp"):
+                # Audit fix (C3): a failed/empty quote must NOT also skip the mandatory
+                # 2:30 PM force-close below — that used to `continue` right here,
+                # letting a position with one bad audit tick (illiquid strike, transient
+                # API hiccup) stay ACTIVE indefinitely with a stale premium straight
+                # through market close. Only the target/SL cross-checks need a fresh
+                # quote; the time-stop must fire unconditionally. Fall back to the last
+                # known premium (or entry price if none yet) for the force-close fill.
+                if not past_time_stop:
+                    continue
+                current_premium = float(sig.premium_cmp) if sig.premium_cmp is not None else entry_premium
+                logger.warning(
+                    "[OPTION_BUYING] %s quote unavailable at time-stop — force-closing at last known premium %.2f.",
+                    sig.symbol, current_premium,
+                )
+            else:
+                current_premium = round_to_tick(float(quote["ltp"]))
 
             new_status = None
             # Pessimistic by design (matches live_signal_service._scan_bars_for_exit): if a
@@ -264,6 +348,14 @@ def update_option_buying_outcomes() -> None:
             logger.error("[OPTION_BUYING] Outcome check failed for %s: %s", sig.symbol, e)
             continue
 
+    # ── Daily Loss Limit Kill Switch (C2) ────────────────────────────────────────
+    # Evaluated after outcomes are settled so realised/unrealised P&L is current —
+    # same placement as live_signal_service's intraday equivalent.
+    try:
+        _enforce_option_buying_daily_loss_limit(now_ist)
+    except Exception as exc:
+        logger.error("[OPTION_BUYING][KILL_SWITCH] evaluation failed: %s", exc)
+
 
 def get_option_buying_signals(action: str | None = None) -> dict[str, Any]:
     """Scan F&O-eligible stocks for high-conviction breakout setups and buy near-ATM
@@ -277,6 +369,17 @@ def get_option_buying_signals(action: str | None = None) -> dict[str, Any]:
         return {"signals": [], "market_status": "CLOSED", "reason": "market_closed"}
 
     now_ist = datetime.now(tz=IST)
+
+    # ── Daily Loss Limit Kill Switch (C2) ────────────────────────────────────────
+    # Set by update_option_buying_outcomes() once today's realised + unrealised P&L
+    # breaches OPTION_BUYING_DAILY_LOSS_LIMIT_PCT; positions are flattened there, here
+    # we simply refuse to open anything new for the rest of the session — same
+    # placement/pattern as intraday_service.get_live_signals()'s equivalent check.
+    if cache.get(OPTION_BUYING_DAILY_HALT_CACHE_KEY):
+        logger.warning("[OPTION_BUYING] Daily loss limit reached — signal generation halted for today.")
+        payload = _live_option_buying_payload()
+        payload.update({"market_status": "OPEN", "halted": True, "reason": "daily_loss_limit"})
+        return payload
 
     # Stop opening new positions well before the hard time-stop (OPTION_BUYING_TIME_STOP,
     # 2:30 PM) that force-exits them regardless of P&L — a position needs real runway to

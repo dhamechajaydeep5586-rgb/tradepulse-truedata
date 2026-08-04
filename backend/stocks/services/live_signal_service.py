@@ -404,83 +404,91 @@ def update_signal_outcomes(force: bool = False, action: str | None = None):
     # got compared against the underlying stock's price instead of the option premium —
     # force-closing every signal as a bogus HIT_SL within one scan cycle. It has its own
     # correct auditor, update_option_buying_outcomes() (see run_periodic_scanners below).
-    if not active_signals.exists(): return
 
-    # Audit symbols in bulk
-    symbols = list(active_signals.values_list('symbol', flat=True).distinct())
-    prices = get_latest_prices(symbols)
-    
-    now_time = datetime.now(tz=IST).time()
-    
-    # Broker handle for 1-min bar auditing of intraday positions. Resolved once for the
-    # whole pass rather than per signal.
-    _svc = None
-    if any(s.category == 'intraday' for s in active_signals):
-        from stocks.services.truedata_service import get_truedata_instance
-        _svc = get_truedata_instance()
+    # Audit loop only runs when there's something open to audit — but the daily loss
+    # limit below must run unconditionally. An empty book is exactly the state right
+    # after a string of stop-losses closes it out, which is precisely when the kill
+    # switch most needs to be armed, not the condition that used to skip it entirely
+    # (audit fix: this function used to `return` here before ever reaching step 4).
+    prices: dict = {}
+    if active_signals.exists():
+        # Audit symbols in bulk
+        symbols = list(active_signals.values_list('symbol', flat=True).distinct())
+        prices = get_latest_prices(symbols)
 
-    for sig in active_signals:
-        price = prices.get(sig.symbol)
-        if price is None: continue
+        now_time = datetime.now(tz=IST).time()
 
-        # 1. Cutoff Checks
-        if sig.category == 'intraday' and now_time >= INTRADAY_SIGNAL_CUTOFF:
-            sig.status = SignalHistory.Status.CANCELLED if sig.status == SignalHistory.Status.PENDING else SignalHistory.Status.EXPIRED
-            sig.exit_price = price
-            sig.exit_time = now
-            meta = sig.metadata or {}
-            meta.setdefault("exit_reason", "SQUARE_OFF_CUTOFF")
-            sig.metadata = meta
-            sig.save()
-            continue
+        # Broker handle for 1-min bar auditing of intraday positions. Resolved once for
+        # the whole pass rather than per signal.
+        _svc = None
+        if any(s.category == 'intraday' for s in active_signals):
+            from stocks.services.truedata_service import get_truedata_instance
+            _svc = get_truedata_instance()
 
-        # 2. Intraday: audit against 1-min bar highs/lows, with a time stop. Exits are
-        # auto-squared off on a Target/SL touch exactly like every other category;
-        # anything still open at the 3:20 PM cutoff above is force-closed regardless.
-        if sig.category == 'intraday' and _svc is not None:
-            try:
-                _audit_intraday_signal(sig, price, now, _svc)
-            except Exception as exc:
-                logger.error("[INTRADAY][AUDIT] %s failed: %s", sig.symbol, exc)
-            continue
+        for sig in active_signals:
+            price = prices.get(sig.symbol)
+            if price is None: continue
 
-        # 3. Standard Equity Logic (other categories)
-        target = float(sig.target)
-        sl = float(sig.stop_loss)
-        
-        if sig.status == SignalHistory.Status.PENDING:
-            entry = float(sig.entry_price)
-            if abs(price - entry) / entry < 0.002: # 0.2% tolerance for trigger
-                sig.status = SignalHistory.Status.ACTIVE
-                sig.active_time = now
+            # 1. Cutoff Checks
+            if sig.category == 'intraday' and now_time >= INTRADAY_SIGNAL_CUTOFF:
+                sig.status = SignalHistory.Status.CANCELLED if sig.status == SignalHistory.Status.PENDING else SignalHistory.Status.EXPIRED
+                sig.exit_price = price
+                sig.exit_time = now
+                meta = sig.metadata or {}
+                meta.setdefault("exit_reason", "SQUARE_OFF_CUTOFF")
+                sig.metadata = meta
                 sig.save()
-        
-        if sig.status == SignalHistory.Status.ACTIVE:
-            if sig.signal_type == "BUY":
-                if price >= target:
-                    sig.status = SignalHistory.Status.HIT_TARGET
-                    sig.exit_price = target
-                    sig.exit_time = now
+                continue
+
+            # 2. Intraday: audit against 1-min bar highs/lows, with a time stop. Exits
+            # are auto-squared off on a Target/SL touch exactly like every other
+            # category; anything still open at the 3:20 PM cutoff above is
+            # force-closed regardless.
+            if sig.category == 'intraday' and _svc is not None:
+                try:
+                    _audit_intraday_signal(sig, price, now, _svc)
+                except Exception as exc:
+                    logger.error("[INTRADAY][AUDIT] %s failed: %s", sig.symbol, exc)
+                continue
+
+            # 3. Standard Equity Logic (other categories)
+            target = float(sig.target)
+            sl = float(sig.stop_loss)
+
+            if sig.status == SignalHistory.Status.PENDING:
+                entry = float(sig.entry_price)
+                if abs(price - entry) / entry < 0.002: # 0.2% tolerance for trigger
+                    sig.status = SignalHistory.Status.ACTIVE
+                    sig.active_time = now
                     sig.save()
-                elif price <= sl:
-                    sig.status = SignalHistory.Status.HIT_SL
-                    sig.exit_price = sl
-                    sig.exit_time = now
-                    sig.save()
-            else: # SELL
-                if price <= target:
-                    sig.status = SignalHistory.Status.HIT_TARGET
-                    sig.exit_price = target
-                    sig.exit_time = now
-                    sig.save()
-                elif price >= sl:
-                    sig.status = SignalHistory.Status.HIT_SL
-                    sig.exit_price = sl
-                    sig.exit_time = now
-                    sig.save()
+
+            if sig.status == SignalHistory.Status.ACTIVE:
+                if sig.signal_type == "BUY":
+                    if price >= target:
+                        sig.status = SignalHistory.Status.HIT_TARGET
+                        sig.exit_price = target
+                        sig.exit_time = now
+                        sig.save()
+                    elif price <= sl:
+                        sig.status = SignalHistory.Status.HIT_SL
+                        sig.exit_price = sl
+                        sig.exit_time = now
+                        sig.save()
+                else: # SELL
+                    if price <= target:
+                        sig.status = SignalHistory.Status.HIT_TARGET
+                        sig.exit_price = target
+                        sig.exit_time = now
+                        sig.save()
+                    elif price >= sl:
+                        sig.status = SignalHistory.Status.HIT_SL
+                        sig.exit_price = sl
+                        sig.exit_time = now
+                        sig.save()
 
     # 4. Daily loss limit — evaluated after outcomes are settled so realised P&L is
-    # current. Flattens intraday and blocks further generation for the session.
+    # current. Flattens intraday and blocks further generation for the session. Runs
+    # even when active_signals was empty above — see comment before that block.
     try:
         _enforce_daily_loss_limit(prices, now)
     except Exception as exc:

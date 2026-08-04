@@ -1,5 +1,5 @@
 from datetime import datetime, date
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from django.test import TestCase
@@ -957,6 +957,63 @@ class SpecialistStrangleInstitutionalUpgradesTests(TestCase):
             self.assertIn(80.0, strikes_selected)
 
 
+class AssignmentRiskFlagTests(TestCase):
+    """
+    Audit fix C4: NSE stock options are American-style / physically settled, unlike
+    index options — nothing previously distinguished that risk anywhere in the
+    strangle-selling engine. is_physical_settlement_risk() is the extracted
+    classification logic used by the live audit loop in get_hedge_panel_data().
+    """
+
+    def test_stock_underlying_near_itm_flags_risk(self):
+        from stocks.services.delta_hedge_service import is_physical_settlement_risk
+        from stocks.services.config_vol import ASSIGNMENT_RISK_DELTA
+
+        self.assertTrue(is_physical_settlement_risk("RELIANCE", ASSIGNMENT_RISK_DELTA))
+        self.assertTrue(is_physical_settlement_risk("RELIANCE", ASSIGNMENT_RISK_DELTA + 0.1))
+
+    def test_stock_underlying_far_otm_does_not_flag(self):
+        from stocks.services.delta_hedge_service import is_physical_settlement_risk
+        from stocks.services.config_vol import ASSIGNMENT_RISK_DELTA
+
+        self.assertFalse(is_physical_settlement_risk("RELIANCE", ASSIGNMENT_RISK_DELTA - 0.1))
+
+    def test_index_underlying_never_flags_regardless_of_delta(self):
+        """Index options are cash-settled — no assignment risk exists even deep ITM."""
+        from stocks.services.delta_hedge_service import is_physical_settlement_risk
+
+        for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+            self.assertFalse(is_physical_settlement_risk(idx, 0.99))
+
+    def test_build_specialist_hedge_tags_stock_legs_as_optstk(self):
+        """build_specialist_hedge()'s legs carry instrument_type so the panel/audit
+        loop can classify assignment risk without re-deriving it per leg."""
+        from stocks.services.delta_hedge_service import build_specialist_hedge
+
+        strikes = [
+            {'strike': '10100', 'symbol': 'MOCK101CE', 'expiry': '25Jun2026', 'token': '1', 'exch_seg': 'NFO', 'lotsize': '100'},
+            {'strike': '9900', 'symbol': 'MOCK99PE', 'expiry': '25Jun2026', 'token': '2', 'exch_seg': 'NFO', 'lotsize': '100'},
+        ]
+        orch = MagicMock()
+        orch.get_option_data.return_value = ({'ltp': 8.50, 'bid': 8.45, 'ask': 8.55}, 'token')
+
+        with patch("stocks.services.delta_hedge_service.get_nse_option_strikes", return_value=strikes), \
+             patch("stocks.services.delta_hedge_service.estimate_iv", return_value=0.22), \
+             patch("stocks.services.delta_hedge_service.get_lot_size", return_value=1000), \
+             patch("stocks.services.delta_hedge_service.find_strike_by_delta", side_effect=[
+                 strikes[0], strikes[1], strikes[0], strikes[1],
+             ]), \
+             patch("django.utils.timezone.now") as mock_now:
+            from datetime import time as _time
+            mock_now.return_value.astimezone.return_value.date.return_value = datetime(2026, 6, 1).date()
+            mock_now.return_value.astimezone.return_value.time.return_value = _time(10, 0)
+
+            res = build_specialist_hedge("MOCK", "NFO", 100.0, orch, sigma=0.22)
+
+        self.assertTrue(len(res) >= 2)
+        self.assertTrue(all(leg.get('instrument_type') == 'OPTSTK' for leg in res))
+
+
 class OptionGreeksServiceTests(TestCase):
     """AUDIT_REMEDIATION_PLAN.md #3.2.3 — estimate_iv must never raise ZeroDivisionError.
 
@@ -1038,6 +1095,154 @@ class ResolveTargetExpiryTests(TestCase):
         from stocks.services.delta_hedge_service import resolve_target_expiry
 
         self.assertIsNone(resolve_target_expiry([], min_days=3))
+
+
+class DailyLossHaltArmsOnEmptyBookTests(TestCase):
+    """
+    Audit fix (C1): the daily loss halt must arm from today's closed SignalHistory
+    rows even when active_signals is empty — that's exactly the state right after a
+    string of stop-losses closes the book, which is precisely when the kill switch
+    is needed most. update_signal_outcomes() used to `return` before ever reaching
+    _enforce_daily_loss_limit() in that case.
+    """
+
+    def setUp(self):
+        from django.core.cache import cache
+        from stocks.services.intraday_service import DAILY_HALT_CACHE_KEY
+        self.cache = cache
+        self.halt_key = DAILY_HALT_CACHE_KEY
+        self.cache.delete(self.halt_key)
+        self.patcher_static_closed = patch("stocks.services.signal_utils.is_static_closed", return_value=False)
+        self.patcher_static_closed.start()
+        # _enforce_daily_loss_limit's `today = datetime.now(tz=IST).date()` must line up
+        # with the generated_at date on the test fixtures below (same pattern as
+        # UpdateSignalOutcomesTests).
+        self.patcher_datetime = patch("stocks.services.live_signal_service.datetime", MockDatetime)
+        self.patcher_datetime.start()
+        MockDatetime._mock_now = datetime(2026, 4, 1, 13, 15, tzinfo=IST)
+
+    def tearDown(self):
+        self.patcher_static_closed.stop()
+        self.patcher_datetime.stop()
+        MockDatetime._mock_now = None
+        self.cache.delete(self.halt_key)
+
+    def _closed_signal(self, symbol: str, entry: float, exit_price: float, qty: int):
+        signal = SignalHistory.objects.create(
+            symbol=symbol, signal_type="BUY", entry_price=entry, stop_loss=entry * 0.98,
+            target=entry * 1.02, rr=2.0, status=SignalHistory.Status.HIT_SL,
+            category="intraday", reason="test", exit_price=exit_price,
+            metadata={"qty": qty},
+        )
+        generated_at = datetime(2026, 4, 1, 9, 30, tzinfo=IST)
+        SignalHistory.objects.filter(pk=signal.pk).update(generated_at=generated_at)
+        return signal
+
+    @patch("stocks.services.live_signal_service.get_latest_prices")
+    def test_halt_arms_with_zero_active_signals(self, mock_get_prices):
+        # All positions already stopped out — book is flat, nothing ACTIVE/PENDING.
+        # Combined realised loss exceeds the 2% of Rs.5,00,000 = Rs.10,000 default limit.
+        self._closed_signal("SYM1", entry=100.0, exit_price=90.0, qty=600)  # -Rs.6,000
+        self._closed_signal("SYM2", entry=100.0, exit_price=90.0, qty=600)  # -Rs.6,000
+        mock_get_prices.return_value = {}
+
+        test_now = datetime(2026, 4, 1, 13, 15, tzinfo=IST)
+        with patch("stocks.services.live_signal_service.dj_timezone.now", return_value=test_now):
+            update_signal_outcomes(force=True)
+
+        self.assertTrue(
+            self.cache.get(self.halt_key),
+            "Daily loss halt must arm from closed rows even with an empty active book",
+        )
+
+    @patch("stocks.services.live_signal_service.get_latest_prices")
+    def test_halt_does_not_arm_when_loss_within_limit(self, mock_get_prices):
+        # Sanity check: a small loss well within the limit must not trip the halt.
+        self._closed_signal("SYM1", entry=100.0, exit_price=99.0, qty=100)  # -Rs.100
+        mock_get_prices.return_value = {}
+
+        test_now = datetime(2026, 4, 1, 13, 15, tzinfo=IST)
+        with patch("stocks.services.live_signal_service.dj_timezone.now", return_value=test_now):
+            update_signal_outcomes(force=True)
+
+        self.assertFalse(self.cache.get(self.halt_key))
+
+
+class OptionBuyingDailyLossHaltTests(TestCase):
+    """
+    Audit fixes C2 (no daily loss circuit breaker existed for option buying at all)
+    and C3 (a failed quote fetch used to skip the mandatory 2:30 PM force-close).
+    """
+
+    def setUp(self):
+        from django.core.cache import cache
+        from stocks.services.option_buying_service import OPTION_BUYING_DAILY_HALT_CACHE_KEY
+        self.cache = cache
+        self.halt_key = OPTION_BUYING_DAILY_HALT_CACHE_KEY
+        self.cache.delete(self.halt_key)
+
+    def tearDown(self):
+        self.cache.delete(self.halt_key)
+
+    def _closed_signal(self, symbol, entry, exit_price, status, strike=100.0, option_type="CE"):
+        from stocks.models import SignalHistory as SH
+        return SH.objects.create(
+            symbol=symbol, signal_type="BUY_CE", category="option_buying",
+            entry_price=entry, stop_loss=entry * 0.5, target=entry * 2.0, rr=2.0,
+            status=status, reason="test", exit_price=exit_price,
+            strike_price=strike, option_type=option_type,
+        )
+
+    @patch("stocks.services.delta_hedge_service.get_lot_size", return_value=50)
+    def test_c2_halt_arms_from_closed_rows_with_empty_active_book(self, mock_lot_size):
+        """A day of stopped-out option_buying trades (nothing ACTIVE) must still arm
+        the halt — same empty-book scenario as C1's intraday fix. Uses real "now" for
+        both generated_at (auto_now_add) and the check itself, so no date faking is
+        needed for the generated_at__date=today match."""
+        from django.utils import timezone as dj_timezone
+        from stocks.services.option_buying_service import (
+            _enforce_option_buying_daily_loss_limit, OPTION_BUYING_DAILY_HALT_CACHE_KEY,
+        )
+        from stocks.services.intraday_service import INTRADAY_ACCOUNT_EQUITY
+
+        # 2-lot P&L per Re.1 move = lot_size(50)*2 = 100. Loss of Rs.3/premium * 100 =
+        # Rs.300 per trade; enough trades to clear the 2% limit regardless of its value.
+        limit = INTRADAY_ACCOUNT_EQUITY * 0.02
+        per_trade_loss = 3.0 * 100
+        n = int(limit // per_trade_loss) + 2
+        for i in range(n):
+            self._closed_signal(f"SYM{i}", entry=50.0, exit_price=47.0, status=SignalHistory.Status.HIT_SL)
+
+        now_ist = dj_timezone.now().astimezone(IST)
+        halted = _enforce_option_buying_daily_loss_limit(now_ist)
+
+        self.assertTrue(halted)
+        self.assertTrue(self.cache.get(OPTION_BUYING_DAILY_HALT_CACHE_KEY))
+
+    def test_c3_failed_quote_still_force_closes_at_time_stop(self):
+        """A quote fetch failure at/after 2:30 PM must not leave the position stuck
+        ACTIVE — it force-closes at the last known premium instead of being skipped."""
+        from unittest.mock import MagicMock
+        from stocks.services.option_buying_service import update_option_buying_outcomes
+
+        sig = self._closed_signal(
+            "OPTSYM", entry=50.0, exit_price=None, status=SignalHistory.Status.ACTIVE,
+        )
+        sig.premium_cmp = 48.0
+        sig.save(update_fields=["premium_cmp"])
+
+        mock_svc = MagicMock()
+        mock_svc.get_option_quote.return_value = None  # quote fetch fails
+
+        past_time_stop = datetime(2026, 4, 1, 14, 35, tzinfo=IST)  # after 2:30 PM
+        with patch("stocks.services.truedata_service.get_truedata_instance", return_value=mock_svc), \
+             patch("stocks.services.option_buying_service.datetime") as mock_dt:
+            mock_dt.now.return_value = past_time_stop
+            update_option_buying_outcomes()
+
+        sig.refresh_from_db()
+        self.assertIn(sig.status, (SignalHistory.Status.HIT_TARGET, SignalHistory.Status.HIT_SL))
+        self.assertEqual(float(sig.exit_price), 48.0)
 
 
 class OptionChainFallbackTests(TestCase):
