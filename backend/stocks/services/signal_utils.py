@@ -55,10 +55,9 @@ INTRADAY_GENERATION_START = time(9, 45)
 # position, which is a costlier mistake here than for equity.
 OPTION_BUYING_GENERATION_START = time(10, 0)
 
-# Intraday scanner's stock universe. NIFTY100 by default (down from NIFTY500) to bound
-# Angel One REST call volume per scan cycle — drop to "NIFTY50" here if rate-limit
-# pressure persists after the bulk-quote batching fix in intraday_service.py.
-INTRADAY_UNIVERSE = "NIFTY100"
+# Intraday scanner's stock universe. NIFTY50 — narrowed further from NIFTY100 at the
+# account owner's explicit request 2026-08-05.
+INTRADAY_UNIVERSE = "NIFTY50"
 
 # ---------------------------------------------------------------------------
 # NSE Market Status API  (primary source — overrides static calendar)
@@ -622,7 +621,6 @@ def fetch_nifty500_symbols_live() -> list[str]:
 
 def load_symbols_from_stock_table() -> list[str]:
     """Overridden to use live fetching first, bypassing heavy 'Stock' table.
-    Uses INTRADAY_UNIVERSE (NIFTY100 by default) to bound Angel One REST call volume —
-    drop INTRADAY_UNIVERSE to "NIFTY50" if rate-limit pressure persists."""
+    Uses INTRADAY_UNIVERSE (NIFTY50) to bound Angel One REST call volume."""
     return fetch_nifty_symbols_live(INTRADAY_UNIVERSE)
 

@@ -128,7 +128,7 @@ def _fallback_sigma(symbol: str, meta_iv: float | None) -> float:
 SPECIALISTS = []
 
 # Static NIFTY50-sized snapshot — last-resort fallback only if the live NSE fetch
-# below (now NIFTY100) fails. Deliberately not widened to a full 100-name list: this
+# below (NIFTY50) fails. Deliberately not widened to a full 100-name list: this
 # only fires if both the live fetch AND the DB fallback in fetch_nifty_symbols_live
 # are down, and a smaller-but-correct candidate set beats hand-typing 100 tickers
 # with no live source to verify them against.
@@ -150,7 +150,7 @@ _NIFTY_50_FALLBACK = [
 
 
 def NIFTY_50_STOCKS() -> list[str]:
-    return fetch_nifty_symbols_live("NIFTY100") or _NIFTY_50_FALLBACK
+    return fetch_nifty_symbols_live("NIFTY50") or _NIFTY_50_FALLBACK
 
 ENTRY_WINDOW_START = time(10, 45)   # Intraday: capture premiums starting from 10:45 AM (Theta optimization after volatility settles)
 ENTRY_WINDOW_END = time(15, 30)    # Hard stop for Equity at 3:30 PM

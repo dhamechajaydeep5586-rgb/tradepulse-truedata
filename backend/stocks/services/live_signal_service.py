@@ -576,7 +576,7 @@ def _run_periodic_scanners_impl(action: str | None = None):
         if market_open:
             # ── SPECIALIST SCAN (generates signals + sends Telegram) ──
             # This MUST run before the intraday scan because get_live_signals()
-            # sweeps the whole Nifty 100 universe via paced REST calls, taking
+            # sweeps the whole Nifty 50 universe via paced REST calls, taking
             # a couple of minutes. Running specialist first ensures Telegram
             # messages fire promptly.
             try:

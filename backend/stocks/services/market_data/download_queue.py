@@ -44,7 +44,7 @@ _TRICKLE_CURSOR_KEY = "candle_queue_trickle_cursor_v2"
 
 
 def get_universe_symbols() -> list[str]:
-    """Raw NIFTY100 symbol list — delegates to signal_utils.fetch_nifty_symbols_live,
+    """Raw NIFTY50 symbol list — delegates to signal_utils.fetch_nifty_symbols_live,
     the one shared live-fetch+cache used by every engine, so an NSE reconstitution
     (a symbol added/removed from the index) lands here the same as everywhere else.
     Deliberately NOT shared.universe.get_trading_universe(), which itself needs
@@ -54,7 +54,7 @@ def get_universe_symbols() -> list[str]:
     """
     from stocks.services.signal_utils import fetch_nifty_symbols_live
 
-    return sorted(set(fetch_nifty_symbols_live("NIFTY100")))
+    return sorted(set(fetch_nifty_symbols_live("NIFTY50")))
 
 
 def enqueue_next_trickle_symbol(interval: str = "ONE_DAY") -> DownloadRequest | None:

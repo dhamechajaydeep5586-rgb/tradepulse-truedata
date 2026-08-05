@@ -101,23 +101,23 @@ def _safe_decimal(value, default=None) -> Decimal | None:
 
 _MAX_LOOKBACK_DAYS = 7  # Max days to walk back when bhavcopy not found
 
-# Narrowed NIFTY500 -> NIFTY50 2026-07-28, then widened NIFTY50 -> NIFTY100 at the
-# account owner's request — the whole platform (intraday, option buying, specialist,
-# short-term, long-term) now scans a single shared NIFTY100 universe. Function name
-# below kept as "nifty500" to avoid touching every call site across
-# trade_engine.py / pro_system_service.py / truedata_service.py.
+# Narrowed NIFTY500 -> NIFTY50 2026-07-28, briefly widened to NIFTY100, then narrowed
+# back to NIFTY50 2026-08-05 at the account owner's request — the whole platform
+# (intraday, option buying, specialist, short-term, long-term) now scans a single
+# shared NIFTY50 universe. Function name below kept as "nifty500" to avoid touching
+# every call site across trade_engine.py / pro_system_service.py / truedata_service.py.
 
 
 def _fetch_nifty500_symbols(session: requests.Session) -> set[str]:
     """Delegates to signal_utils.fetch_nifty_symbols_live — the one shared live-fetch
-    +cache every engine now reads the trading universe through (currently NIFTY100),
+    +cache every engine now reads the trading universe through (currently NIFTY50),
     so a reconstitution (symbol added/removed from the index) lands here the same as
     everywhere else. `session` is unused but kept so existing call sites don't need
     to change.
     """
     from stocks.services.signal_utils import fetch_nifty_symbols_live
 
-    return set(fetch_nifty_symbols_live("NIFTY100"))
+    return set(fetch_nifty_symbols_live("NIFTY50"))
 
 
 def _fetch_delivery_data(session: requests.Session, target_date: date) -> dict[str, Decimal]:
@@ -258,7 +258,7 @@ def fetch_and_store_bhavcopy(target_date: date) -> tuple[int, date]:
     target_date = actual_date
 
     # Fetch the platform's trading universe symbols, delivery data, and FO OI data
-    # (reuse session) — despite the function name, this is NIFTY100 now, not NIFTY50.
+    # (reuse session) — function name says "nifty500" but this is NIFTY50.
     universe_symbols = _fetch_nifty500_symbols(session)
     delivery_map = _fetch_delivery_data(session, target_date)
     oi_map = _fetch_fo_oi_data(session, target_date)

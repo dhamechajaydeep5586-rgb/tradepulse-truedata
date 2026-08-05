@@ -358,7 +358,7 @@ export default function LiveSignalsTable() {
                   <div className="flex gap-3">
                     <MetricChip label="Buy Signals" value={buyCount} />
                     <MetricChip label="Sell Signals" value={sellCount} />
-                    <MetricChip label="Universe" value="Nifty 100" />
+                    <MetricChip label="Universe" value="Nifty 50" />
                   </div>
                 </div>
               </div>
@@ -371,7 +371,7 @@ export default function LiveSignalsTable() {
               <p className="text-xs text-yellow-300">
                 <span className="font-semibold">Market is closed.</span> Showing next-session outlook
                 based on the volume-profile engine: POC, VAH, VAL, VWAP, ATR, plus volume and momentum
-                filters across the Nifty 100 universe. Signals are indicative — confirm at market open.
+                filters across the Nifty 50 universe. Signals are indicative — confirm at market open.
               </p>
             </div>
           )}
@@ -445,7 +445,7 @@ export default function LiveSignalsTable() {
                   <p className="mt-1 text-xs text-gray-600">
                     {isOpen
                       ? "Low volatility or no breakout confirmed right now."
-                      : "No clear trend setups in Nifty 100 for next session."}
+                      : "No clear trend setups in Nifty 50 for next session."}
                   </p>
                 </div>
               ) : (

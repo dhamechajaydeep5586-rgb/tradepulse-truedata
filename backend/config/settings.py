@@ -419,6 +419,10 @@ TRUEDATA = {
     "WS_PORT": os.getenv("TRUEDATA_WS_PORT", "8084").strip(),
 }
 
+# Read by intraday_service.py / option_buying_service.py via getattr(settings, ...) —
+# every position size derives from this, so it must reflect the real account equity.
+INTRADAY_ACCOUNT_EQUITY = float(os.getenv('INTRADAY_ACCOUNT_EQUITY', 500000))
+
 # ──────────────────────────────────────────────
 # TELEGRAM BOT ALERTS (FREE — Telegram Bot API)
 # ──────────────────────────────────────────────

@@ -128,9 +128,18 @@ past the category's cutoff.
 - Signal generation cutoff: **3:20 PM** (no new signals after this).
 
 ### Stock Universe
-- **Nifty 100** (`INTRADAY_UNIVERSE` in `signal_utils.py`), fetched live from the NSE
-  archive CSV and cached 24h; falls back to the `IndexConstituent` table if NSE is
-  unreachable. Narrowed from Nifty 500 to bound TrueData REST call volume.
+- **Nifty 50** (`INTRADAY.index` / `INTRADAY_UNIVERSE_INDEX` in `shared/profiles.py`,
+  consumed by `shared/universe.py → get_trading_universe()`), fetched live from the NSE
+  archive CSV and cached 6h, then liquidity-filtered (ADV, price, spread — see
+  `shared/universe.py`). `signal_utils.py`'s `INTRADAY_UNIVERSE` constant and
+  `load_symbols_from_stock_table()` are only the fallback path if `get_trading_universe()`
+  returns no symbols; both are kept in sync with the same Nifty 50 tier. Narrowed
+  NIFTY500 → NIFTY50 → NIFTY200 → NIFTY100 → **NIFTY50** (2026-08-05, account owner's
+  request) — every engine (intraday, option buying, specialist/strangle, short-term,
+  long-term) shares this one universe, fetched via `bhavcopy_service._fetch_nifty500_symbols()`
+  and `market_data/download_queue.py`'s candle trickle-warmer, both also pinned to NIFTY50
+  so backfilled candle data matches what's actually scanned. Falls back to the
+  `IndexConstituent` table if NSE is unreachable.
 - Only stocks NOT already having an ACTIVE/PENDING signal today are re-scanned.
 
 ### Scan Logic (`intraday_service.py → get_live_signals`)

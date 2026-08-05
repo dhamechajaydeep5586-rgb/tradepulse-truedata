@@ -12,7 +12,7 @@ export default function LiveSignalsFull() {
             </Link>
             <span className="hidden sm:inline-flex items-center gap-1.5 bg-gray-800 text-gray-400 text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-full">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              Nifty 100 · Volume Profile
+              Nifty 50 · Volume Profile
             </span>
           </div>
           <Link

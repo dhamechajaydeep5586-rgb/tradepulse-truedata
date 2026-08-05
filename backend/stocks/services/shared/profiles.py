@@ -179,13 +179,13 @@ LONG_TERM_FACTOR_WEIGHTS = {
 
 INTRADAY = EngineProfile(
     name="intraday",
-    # Narrowed NIFTY200 -> NIFTY50 2026-07-28 at the account owner's explicit request:
-    # candle_bars was accumulating ONE_DAY/FIVE_MINUTE rows for the full 200-symbol
+    # Narrowed NIFTY100 -> NIFTY50 2026-08-05 at the account owner's explicit request:
+    # candle_bars was accumulating ONE_DAY/FIVE_MINUTE rows for the full 100-symbol
     # universe (including illiquid names never actually scanned), adding to Supabase
-    # usage-limit pressure, and a 200-symbol universe takes far longer to backfill/
+    # usage-limit pressure, and a 100-symbol universe takes far longer to backfill/
     # warm than a 50-symbol one. Override via INTRADAY_UNIVERSE_INDEX env var if the
     # universe needs widening back out later.
-    index=_s("INTRADAY_UNIVERSE_INDEX", "NIFTY100"),
+    index=_s("INTRADAY_UNIVERSE_INDEX", "NIFTY50"),
     bar_interval="FIVE_MINUTE",
     min_adv_inr=_s("INTRADAY_MIN_ADV_INR", 50_00_00_000.0),   # ₹50 cr
     min_price_inr=_s("INTRADAY_MIN_PRICE", 100.0),
