@@ -26,11 +26,25 @@ async function fetchNotificationsShared() {
   }
 }
 
+// Audit fix (found in a follow-up audit): the L1 fix above made the 15s poll a
+// shared singleton, but each mounted instance still registered its OWN
+// `visibilitychange` listener — with the two simultaneously-mounted instances
+// the L1 comment already describes (mobile + desktop, CSS-hidden not
+// unmounted), a single tab-focus event fired fetchNotificationsShared() twice.
+// Moved into the same singleton lifecycle as the poll interval: registered
+// once when the first instance subscribes, removed once the last unsubscribes.
+function handleVisibilityChange() {
+  if (document.visibilityState === 'visible') {
+    fetchNotificationsShared();
+  }
+}
+
 function subscribeToNotifications(listener) {
   listeners.add(listener);
   if (listeners.size === 1) {
     fetchNotificationsShared();
     pollIntervalId = setInterval(fetchNotificationsShared, 15000); // Check every 15s
+    document.addEventListener('visibilitychange', handleVisibilityChange);
   } else {
     // A second (or later) mounted instance starts from whatever the shared
     // singleton already knows, instead of waiting for the next 15s tick.
@@ -38,9 +52,12 @@ function subscribeToNotifications(listener) {
   }
   return () => {
     listeners.delete(listener);
-    if (listeners.size === 0 && pollIntervalId) {
-      clearInterval(pollIntervalId);
-      pollIntervalId = null;
+    if (listeners.size === 0) {
+      if (pollIntervalId) {
+        clearInterval(pollIntervalId);
+        pollIntervalId = null;
+      }
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     }
   };
 }
@@ -52,22 +69,15 @@ export default function NotificationBell() {
   const dropdownRef = useRef(null);
 
   useEffect(() => {
+    // visibilitychange handling now lives inside subscribeToNotifications'
+    // singleton lifecycle (registered once for however many instances are
+    // mounted) — see the comment above it.
     const unsubscribe = subscribeToNotifications((state) => {
       setNotifications(state.notifications);
       setUnreadCount(state.unreadCount);
     });
 
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        fetchNotificationsShared();
-      }
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => {
-      unsubscribe();
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
+    return unsubscribe;
   }, []);
 
   // Click outside to close

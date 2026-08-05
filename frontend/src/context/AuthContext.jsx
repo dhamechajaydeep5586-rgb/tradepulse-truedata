@@ -40,6 +40,27 @@ export function AuthProvider({ children }) {
     }
   }, [token, fetchProfile]);
 
+  // Audit fix (found in a follow-up audit): axios.js's 401 interceptor silently
+  // refreshes the access token and writes it to localStorage, but previously
+  // never told this context — `token` state stayed pinned to whatever was set at
+  // last login()/logout(), so any consumer of useAuth().token (rather than the
+  // interceptor's own localStorage read) kept using a stale, expired value.
+  // axios.js dispatches these two window events on refresh success/failure;
+  // sync React state to match rather than letting it drift from localStorage.
+  useEffect(() => {
+    const handleRefreshed = (e) => setToken(e.detail.access);
+    const handleLogout = () => {
+      setToken(null);
+      setUser(null);
+    };
+    window.addEventListener("auth:token-refreshed", handleRefreshed);
+    window.addEventListener("auth:logout", handleLogout);
+    return () => {
+      window.removeEventListener("auth:token-refreshed", handleRefreshed);
+      window.removeEventListener("auth:logout", handleLogout);
+    };
+  }, []);
+
   // AUTO-LOGOUT TIMER for guest users
   useEffect(() => {
     if (user && user.is_temporary && user.first_login_at) {

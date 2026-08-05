@@ -92,10 +92,22 @@ API.interceptors.response.use(
             `${API.defaults.baseURL}/api/auth/token/refresh/`,
             { refresh: refreshToken }
           );
-          
+
           localStorage.setItem("access", data.access);
           if (data.refresh) localStorage.setItem("refresh", data.refresh);
-          
+          // Audit fix (found in a follow-up audit): this silent refresh only ever
+          // wrote the new access token to localStorage — AuthContext's `token`
+          // React state (read by every component via useAuth()) kept holding the
+          // OLD, now-expired value, since nothing re-synced it outside of an
+          // explicit login()/logout() call. Any code path reading `token` from
+          // context instead of localStorage (rather than relying on this
+          // interceptor's own localStorage read on the next request) would keep
+          // using a dead token indefinitely. AuthContext listens for this event
+          // and calls setToken() to bring React state back in sync.
+          window.dispatchEvent(
+            new CustomEvent("auth:token-refreshed", { detail: { access: data.access } })
+          );
+
           processQueue(null, data.access);
           originalRequest.headers.Authorization = `Bearer ${data.access}`;
           return API(originalRequest);
@@ -103,11 +115,24 @@ API.interceptors.response.use(
           processQueue(refreshError, null);
           localStorage.removeItem("access");
           localStorage.removeItem("refresh");
+          // Same fix, failure side: clear AuthContext's `token`/`user` state
+          // immediately rather than leaving it stale until the redirect below
+          // completes (or forever, if something ever intercepts/blocks it).
+          window.dispatchEvent(new CustomEvent("auth:logout"));
           // Redirect with expired flag to show the popup on Login page
           window.location.href = "/login?expired=true";
         } finally {
           isRefreshing = false;
         }
+      } else {
+        // Audit fix M20 (bug found in a follow-up audit): `isRefreshing` was set
+        // true above, but with no refreshToken this whole try/catch/finally block
+        // was skipped entirely — `isRefreshing` never got reset back to false, so
+        // every 401 for the rest of the session queued into failedQueue and never
+        // resolved (permanently "stuck", no network activity, no error surfaced).
+        isRefreshing = false;
+        window.dispatchEvent(new CustomEvent("auth:logout"));
+        window.location.href = "/login?expired=true";
       }
     }
     return Promise.reject(error);

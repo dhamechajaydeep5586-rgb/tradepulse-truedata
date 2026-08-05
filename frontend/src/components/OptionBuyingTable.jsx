@@ -79,6 +79,13 @@ export default function OptionBuyingTable() {
   // the value captured when the effect first ran.
   const isOpenRef = useRef(false);
   const lastFetchAtRef = useRef(0);
+  // Audit fix M17: no request-sequence guard existed on this poller — an
+  // out-of-order response under variable latency (e.g. a slow Force Scan
+  // response arriving after a subsequent plain poll's fast response) could
+  // overwrite fresher state with stale data. requestSeqRef increments per
+  // issued request; a response only applies if it's still the latest one.
+  // Same pattern as LiveSignalsTable.jsx / DeltaHedgePanel.jsx / OptionChainTable.jsx.
+  const requestSeqRef = useRef(0);
 
   const marketStatus = data?.market_status || "CLOSED";
   const isOpen = marketStatus === "OPEN";
@@ -92,18 +99,23 @@ export default function OptionBuyingTable() {
   const fetchData = useCallback((force = false) => {
     setError(null);
     if (force) setLoading(true);
+    const mySeq = ++requestSeqRef.current;
     const url = force ? "/api/stocks/option-buying/?force=true" : "/api/stocks/option-buying/";
     API.get(url)
       .then((res) => {
+        if (mySeq !== requestSeqRef.current) return; // a newer request already superseded this one
         setData(res.data);
         setError(null);
         isOpenRef.current = res.data?.market_status === "OPEN";
       })
       .catch((e) => {
+        if (mySeq !== requestSeqRef.current) return;
         console.error("Error fetching option-buying signals:", e);
         setError("Failed to refresh option-buying signals. Showing last known data.");
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (mySeq === requestSeqRef.current) setLoading(false);
+      });
   }, []);
 
   useEffect(() => {

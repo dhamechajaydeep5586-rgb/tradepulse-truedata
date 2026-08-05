@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import API from "../api/axios";
 
 const typeBadge = {
@@ -13,17 +13,33 @@ export default function SignalsTable({ date }) {
   const [filter, setFilter] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 15;
+  // Audit fix M17-style: no request-sequence guard existed here — a filter/date
+  // change firing a new request while the 15-min poll's older request for a
+  // DIFFERENT filter/date was still in flight could let that stale response land
+  // last and overwrite the table with data for the wrong filter. Same pattern as
+  // LiveSignalsTable.jsx / DeltaHedgePanel.jsx / OptionChainTable.jsx /
+  // OptionBuyingTable.jsx.
+  const requestSeqRef = useRef(0);
 
   useEffect(() => {
     const fetch = () => {
       setLoading(true);
+      const mySeq = ++requestSeqRef.current;
       const params = {};
       if (filter) params.signal_type = filter;
       if (date) params.date = date;
       API.get("/api/stocks/intraday-signals/", { params })
-        .then((r) => setSignals(r.data.results ?? r.data))
-        .catch(() => setSignals([]))
-        .finally(() => setLoading(false));
+        .then((r) => {
+          if (mySeq !== requestSeqRef.current) return; // a newer request already superseded this one
+          setSignals(r.data.results ?? r.data);
+        })
+        .catch(() => {
+          if (mySeq !== requestSeqRef.current) return;
+          setSignals([]);
+        })
+        .finally(() => {
+          if (mySeq === requestSeqRef.current) setLoading(false);
+        });
     };
 
     fetch();

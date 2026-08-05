@@ -1,5 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import API from "../api/axios";
+
+// /api/stocks/live-price-updates/ returns just {symbol: price} — no market_status
+// field to gate off, unlike the signal-list endpoints other components poll — so
+// market hours are computed locally here, matching the 9:15 AM-3:30 PM IST,
+// Mon-Fri window CLAUDE.md documents as the NSE session.
+function isLikelyMarketHoursIST() {
+  const ist = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const day = ist.getDay(); // 0 = Sunday, 6 = Saturday
+  if (day === 0 || day === 6) return false;
+  const minutesSinceMidnight = ist.getHours() * 60 + ist.getMinutes();
+  return minutesSinceMidnight >= 9 * 60 + 15 && minutesSinceMidnight <= 15 * 60 + 30;
+}
 
 export default function DomesticMarketCard() {
   const [data, setData] = useState({
@@ -7,6 +19,7 @@ export default function DomesticMarketCard() {
     BANKNIFTY: { ltp: 0, change: 0, prev: 0 },
   });
   const [loading, setLoading] = useState(true);
+  const lastFetchAtRef = useRef(0);
 
   useEffect(() => {
     const fetchPrices = () => {
@@ -36,8 +49,24 @@ export default function DomesticMarketCard() {
         .catch((err) => console.debug("Domestic Market Card Poll Error:", err));
     };
 
+    // Audit fix (found in a follow-up audit): this used to poll every 30s
+    // unconditionally, 24/7 — nights, weekends, holidays — pure wasted load on
+    // an endpoint that never changes outside market hours. Same cadence-gate
+    // pattern as OptionBuyingTable/LiveSignalsTable: a 30s tick during market
+    // hours, dropping to a 30-min cadence otherwise (still refreshes on load
+    // instead of freezing forever if the tab is left open across the close).
+    const CHECK_MS = 30000;
+    const CLOSED_POLL_MS = 30 * 60 * 1000;
+
+    lastFetchAtRef.current = Date.now();
     fetchPrices();
-    const id = setInterval(fetchPrices, 30000); // 30-second pulse for general market indices
+    const id = setInterval(() => {
+      const now = Date.now();
+      if (isLikelyMarketHoursIST() || now - lastFetchAtRef.current >= CLOSED_POLL_MS) {
+        lastFetchAtRef.current = now;
+        fetchPrices();
+      }
+    }, CHECK_MS);
     return () => clearInterval(id);
   }, []);
 

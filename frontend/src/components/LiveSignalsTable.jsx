@@ -128,9 +128,15 @@ export default function LiveSignalsTable() {
         isOpenRef.current = r.data?.market_status === "OPEN";
         setLastRefreshed(new Date());
         setError(null);
-        // Reset prices when main data changes
+        // Reset prices when main data changes. Audit fix (found in a follow-up
+        // audit): this used to reset the livePrices/prevPrices STATE but not
+        // livePricesRef — the poller below reads the ref (not state) as its merge
+        // base, so the very next 1s poll re-merged stale pre-refresh prices back
+        // on top of the just-cleared state, resurrecting prices for symbols that
+        // may no longer even be in the new signal list.
         setLivePrices({});
         setPrevPrices({});
+        livePricesRef.current = {};
 
         // Notify if there are signals
         if (r.data?.signals?.length > 0) {
