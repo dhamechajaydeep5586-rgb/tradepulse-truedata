@@ -43,6 +43,27 @@ logger = logging.getLogger(__name__)
 _STREAM_CACHE: Dict[str, Dict[str, Any]] = {}
 _STREAM_LOCK = Lock()
 
+# Thread-safe cache for streamed option Greeks, keyed by symbol name — same
+# pattern/lock as _STREAM_CACHE (no separate lock: the two caches are written
+# from the same single queue-worker thread, a second lock would just be more
+# to deadlock on for no real concurrency benefit).
+#
+# Populated ONLY if TrueData has enabled the Greeks feed for this account —
+# per the Market Data API doc's "Realtime Greeks Response" section: "Greeks
+# in websocket needs to be enabled from backend". That's an account-level
+# toggle TrueData support sets, not something any WS request message can turn
+# on client-side (confirmed: the doc's only WS methods are addsymbol/
+# removesymbol/touchline/logout — no "enable greeks" request exists).
+#
+# VERIFIED LIVE (Trial127 sandbox account, 2026-08-05, market open): streamed
+# 40s on 8 actively-traded ATM NIFTY + RELIANCE option contracts (96 trade
+# ticks arrived in that window) and got zero "greeks" messages — only
+# HeartBeat / "symbols added" / "trade". This account does not have the feed
+# enabled. get_stream_greeks() will return None for everyone until TrueData
+# turns it on; callers must fall back to local computation, not treat an
+# empty result as a bug.
+_GREEKS_CACHE: Dict[str, Dict[str, Any]] = {}
+
 
 class TrueDataStreamer:
     """Manages a persistent WebSocket connection to TrueData with async tick processing."""
@@ -187,10 +208,12 @@ class TrueDataStreamer:
 
         if "trade" in data:
             self._process_trade(data["trade"])
+        elif "greeks" in data:
+            self._process_greeks(data["greeks"])
         elif data.get("message") in ("touchline", "symbols added") and data.get("symbollist"):
             for row in data["symbollist"]:
                 self._process_touchline_row(row)
-        # heartbeat / marketstatus / bidask / greeks: nothing downstream reads these yet.
+        # heartbeat / marketstatus / bidask: nothing downstream reads these yet.
 
     def _process_trade(self, fields: List[str]):
         """['trade': [SymbolID, Timestamp, LTP, LTQ, ATP, TTQ, Open, High, Low, ...]]
@@ -230,6 +253,38 @@ class TrueDataStreamer:
                     round((ltp - (close or existing.get("close"))) / (close or existing.get("close")) * 100, 2),
                 "trade_volume": volume,
                 "open_interest": existing.get("open_interest", 0.0),
+                "fetch_time": time.time(),
+                "source": "websocket",
+            }
+
+    def _process_greeks(self, fields: List[str]):
+        """['greeks': [SymbolID, Timestamp, Delta, Gamma, Theta, Vega, Rho, IV]]
+
+        Field order and the 4-decimal precision are exactly as documented
+        (Market Data API doc v2.6, "Realtime Greeks Response") — not guessed.
+        Only ever arrives if the account has the feed enabled; see
+        _GREEKS_CACHE's comment for the live check confirming this one doesn't.
+        """
+        if len(fields) < 8:
+            return
+        symbol_id = str(fields[0])
+        symbol = self._id_to_symbol.get(symbol_id)
+        if not symbol:
+            return  # greeks tick for a symbol we haven't mapped an id for yet
+
+        try:
+            delta, gamma, theta, vega, rho, iv = (float(f) for f in fields[2:8])
+        except (ValueError, IndexError):
+            return
+
+        with _STREAM_LOCK:
+            _GREEKS_CACHE[symbol] = {
+                "delta": delta,
+                "gamma": gamma,
+                "theta": theta,
+                "vega": vega,
+                "rho": rho,
+                "iv": iv,
                 "fetch_time": time.time(),
                 "source": "websocket",
             }
@@ -318,6 +373,13 @@ def get_stream_price(token: str | int) -> Dict[str, Any] | None:
         return _STREAM_CACHE.get(str(token))
 
 
+def get_stream_greeks(token: str | int) -> Dict[str, Any] | None:
+    """Read latest streamed Greeks from the cache. Stays empty unless TrueData
+    has enabled the Greeks WS feed for this account — see _GREEKS_CACHE."""
+    with _STREAM_LOCK:
+        return _GREEKS_CACHE.get(str(token))
+
+
 def _demo():
     """No-network self-check for the pure parsing logic — the part that's
     actually easy to get subtly wrong (field offsets, id/symbol translation)."""
@@ -343,6 +405,17 @@ def _demo():
                        "680949", "1475.05", "1484", "1463", "0", "0", "", "4775"])
     tick3 = get_stream_price("RELIANCE")
     assert tick3["ltp"] == 1472.8 and tick3["close"] == 1984.6, tick3  # close carried over, not misread as 0/OI
+
+    # Greeks — exact sample from the Market Data API doc's "Realtime Greeks
+    # Response" section (symbolid, timestamp, delta, gamma, theta, vega, rho,
+    # iv), not a guessed shape. Live capture (2026-08-05) showed this trial
+    # account never actually emits this message type, so this is the only way
+    # to exercise the parser at all — see _GREEKS_CACHE's comment.
+    s._id_to_symbol["301680343"] = "NIFTY26081124500CE"
+    s._process_greeks(["301680343", "2024-02-14T09:42:02", "0.2015", "0.0331",
+                        "-6.0417", "0.0005", "0.8335", "0.0198"])
+    greeks = get_stream_greeks("NIFTY26081124500CE")
+    assert greeks["delta"] == 0.2015 and greeks["theta"] == -6.0417 and greeks["iv"] == 0.0198, greeks
 
     print("truedata_streamer self-check OK")
 

@@ -2430,6 +2430,15 @@ def rebalance_delta_neutral_strangle(sig, updated_legs, underlying_spot, sig_exc
     except Exception as exc:
         logger.error(f"[REBALANCE] Failed to get quote for new strike {best_strike}: {exc}")
         return
+
+    # Subscribe the newly-rolled-to contract on the WS immediately — without this,
+    # the rolled leg only starts streaming on the NEXT full panel refresh (when
+    # get_hedge_panel_data re-gathers bulk_token_map from the just-saved metadata),
+    # leaving it on the slower single-token REST path for one whole scan cycle.
+    if new_token:
+        svc = get_truedata_instance()
+        if svc and svc.streamer:
+            svc.streamer.subscribe(2, [str(new_token)])
         
     if new_cmp <= 0:
         logger.error(f"[REBALANCE] Invalid CMP {new_cmp} for new strike {best_strike}")
@@ -2512,7 +2521,8 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
     updated_legs = []
     symbol = section['underlying']
     bulk_quotes = bulk_quotes or {}
-    
+    svc = get_truedata_instance()  # used below to prefer WS-streamed Greeks over local Black-Scholes
+
     for leg in legs:
         # OPTION B: Let Winners Run. If this specific leg has already hit SL/Target, or was
         # rolled away by rebalance_delta_neutral_strangle() (status EXPIRED), freeze it —
@@ -2605,17 +2615,33 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
         # position's actual current delta. Pure local math, no Angel One call: only
         # uses underlying_spot already passed in by the caller (no orch.get_price()
         # fallback here, so this never adds REST/WS load).
-        spot_for_delta = float(underlying_spot or 0)
-        if spot_for_delta > 0:
-            try:
-                today_date = timezone.now().astimezone(IST).date()
-                exp_date = datetime.strptime(leg.get('expiry'), "%d%b%Y").date()
-                t_days_live = max(1.0, float((exp_date - today_date).days))
-                sigma_live = _fallback_sigma(symbol, leg.get('live_iv'))
-                fresh_greeks = calculate_greeks(spot_for_delta, leg['strike'], t_days_live, sigma=sigma_live, option_type=leg['option_type'])
-                leg['delta'] = fresh_greeks.get('delta', leg.get('delta', 0.0))
-            except Exception as delta_err:
-                logger.warning(f"[DELTA_REFRESH] Failed to refresh live delta for {symbol} {leg.get('strike')}: {delta_err}")
+        # Prefer TrueData's own streamed Greeks over our local Black-Scholes estimate
+        # when this leg's option contract is actually subscribed on the WS and has
+        # a fresh (<60s) tick — a broker-computed live Greek beats a model estimate
+        # any day it's available. Falls straight through to the existing local-calc
+        # path otherwise (unsubscribed leg, feed not enabled for this account, or a
+        # stale/missing tick) so nothing breaks for the common case.
+        ws_greeks = svc.get_live_greeks_by_token(leg['token']) if svc and leg.get('token') else None
+        if ws_greeks:
+            leg['delta'] = ws_greeks.get('delta', leg.get('delta', 0.0))
+            leg['gamma'] = ws_greeks.get('gamma', leg.get('gamma'))
+            leg['theta'] = ws_greeks.get('theta', leg.get('theta'))
+            leg['vega'] = ws_greeks.get('vega', leg.get('vega'))
+            leg['live_iv'] = ws_greeks.get('iv', leg.get('live_iv'))
+            leg['greeks_source'] = 'websocket'
+        else:
+            spot_for_delta = float(underlying_spot or 0)
+            if spot_for_delta > 0:
+                try:
+                    today_date = timezone.now().astimezone(IST).date()
+                    exp_date = datetime.strptime(leg.get('expiry'), "%d%b%Y").date()
+                    t_days_live = max(1.0, float((exp_date - today_date).days))
+                    sigma_live = _fallback_sigma(symbol, leg.get('live_iv'))
+                    fresh_greeks = calculate_greeks(spot_for_delta, leg['strike'], t_days_live, sigma=sigma_live, option_type=leg['option_type'])
+                    leg['delta'] = fresh_greeks.get('delta', leg.get('delta', 0.0))
+                    leg['greeks_source'] = 'black_scholes'
+                except Exception as delta_err:
+                    logger.warning(f"[DELTA_REFRESH] Failed to refresh live delta for {symbol} {leg.get('strike')}: {delta_err}")
 
         # 2. Baseline Price Logic (Entry Persistence)
         # Unique cache key per Signal ID to prevent cross-trade price contamination

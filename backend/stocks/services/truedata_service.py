@@ -35,7 +35,7 @@ from typing import Any, Dict, List
 import pandas as pd
 import requests
 
-from .truedata_streamer import TrueDataStreamer, get_stream_price, _STREAM_LOCK, _STREAM_CACHE
+from .truedata_streamer import TrueDataStreamer, get_stream_price, get_stream_greeks, _STREAM_LOCK, _STREAM_CACHE
 
 logger = logging.getLogger(__name__)
 
@@ -405,6 +405,20 @@ class TrueDataService:
             if age < 60:
                 return tick
         return self.get_bulk_quotes({exchange: [symbol]}).get(f"{exchange}:{symbol}")
+
+    def get_live_greeks_by_token(self, token: str | int) -> dict[str, Any] | None:
+        """WS-only, unlike get_live_price_by_token above — TrueData's Greeks feed
+        is an account-level backend toggle with no REST equivalent for a single
+        live contract's streaming greeks (see truedata_streamer._GREEKS_CACHE),
+        so there is nothing to fall back to here. Returns None if this account's
+        feed isn't enabled or the last tick is stale; callers (delta_hedge_service)
+        are expected to fall back to their own local Black-Scholes calculation in
+        that case. Same 60s freshness bound as get_live_price_by_token.
+        """
+        greeks = get_stream_greeks(str(token))
+        if greeks and (time.time() - greeks.get("fetch_time", 0)) < 60:
+            return greeks
+        return None
 
     # -------------------------------------------------------------- symbols
 
