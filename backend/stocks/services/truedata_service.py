@@ -476,12 +476,9 @@ class TrueDataService:
         every existing caller); converted to TrueData's yyyymmdd for the
         request, kept in '%d%b%Y' form on the returned rows.
 
-        UNVERIFIED: getoptionchain's exact CSV column names have not been
-        confirmed against a live TrueData account (no sample response was
-        available during this migration — see doc/TRUEDATA_MIGRATION_PLAN.md).
-        Field lookups below try the documented/likely names defensively; treat
-        this function as the top item to verify before the specialist
-        (strangle-selling) engine trades on it for real.
+        VERIFIED against a live TrueData account (2026-08-05): the CSV response
+        is headerless positional data, not the named-header format originally
+        guessed — see the column comment inline below.
         """
         self._ensure_fresh_token()
         try:
@@ -494,13 +491,22 @@ class TrueDataService:
             response = self._rest_request("GET", url, params=params, timeout=15)
             if response.status_code != 200:
                 return []
-            reader = csv.DictReader(io.StringIO(response.text.strip()))
+            # CONFIRMED (live account, 2026-08-05): getoptionchain returns headerless
+            # positional CSV, NOT a DictReader-style header + rows. Columns are:
+            # token, tradingsymbol, option_type, "", exchange, lotsize, strike,
+            # expiry(DD-MM-YYYY), short_code, tradingsymbol_again. csv.DictReader used
+            # to treat the first data row as fabricated header names, so every row.get()
+            # lookup silently returned None for every symbol — see get_lot_size's H18
+            # note; this was the actual cause, not a broker-connection/entitlement issue.
             index_underlyings = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
             rows = []
-            for row in reader:
-                strike = row.get("strike") or row.get("Strike")
-                trading_symbol = row.get("symbol") or row.get("tradingsymbol") or row.get("Symbol")
-                option_type = (row.get("option_type") or row.get("series") or row.get("Series") or "").upper()
+            for cols in csv.reader(io.StringIO(response.text.strip())):
+                if len(cols) < 8:
+                    continue
+                trading_symbol = cols[1].strip()
+                option_type = cols[2].strip().upper()
+                lotsize = cols[5].strip()
+                strike = cols[6].strip()
                 if not strike or not trading_symbol:
                     continue
                 try:
@@ -514,7 +520,7 @@ class TrueDataService:
                     "symbol": trading_symbol if trading_symbol[-2:] in ("CE", "PE") else f"{trading_symbol}{option_type}",
                     "expiry": expiry,
                     "strike": str(strike_val * 100),  # matches Angel One master's strike*100 convention callers already divide out
-                    "lotsize": row.get("lotsize") or row.get("lot_size") or 0,
+                    "lotsize": lotsize or 0,
                     "instrumenttype": "OPTIDX" if symbol.upper() in index_underlyings else "OPTSTK",
                 })
             return rows
@@ -554,15 +560,15 @@ class TrueDataService:
             response = self._rest_request("GET", url, params=params, timeout=15)
             if response.status_code != 200:
                 return []
-            reader = csv.DictReader(io.StringIO(response.text.strip()))
+            # Headerless positional CSV — see get_option_chain's column comment.
             strikes = set()
-            for row in reader:
-                strike = row.get("strike") or row.get("Strike")
-                if strike:
-                    try:
-                        strikes.add(float(strike))
-                    except ValueError:
-                        continue
+            for cols in csv.reader(io.StringIO(response.text.strip())):
+                if len(cols) < 8:
+                    continue
+                try:
+                    strikes.add(float(cols[6].strip()))
+                except ValueError:
+                    continue
             return sorted(strikes)
         except Exception as e:
             logger.error("[TRUEDATA] option chain fetch failed for %s/%s: %s", symbol, expiry, e)
