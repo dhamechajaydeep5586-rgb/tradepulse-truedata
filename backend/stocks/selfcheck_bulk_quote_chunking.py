@@ -12,6 +12,7 @@ Verifies: for a 78-token list, get_bulk_quotes is called twice (50 + 28), never 
 with all 78 — the exact shape of the bug being fixed. No network/DB — mocks
 get_truedata_instance entirely.
 """
+import itertools
 import os
 import sys
 import django
@@ -46,8 +47,8 @@ strikes = [{"token": str(1000 + i), "symbol": f"X{i}CE"} for i in range(78)]
 with patch.object(dhs, "get_truedata_instance", return_value=mock_svc):
     _svc_inst = dhs.get_truedata_instance()
     tokens_to_warm = [str(row["token"]) for row in strikes if row.get("token")]
-    for i in range(0, len(tokens_to_warm), 50):
-        _svc_inst.get_bulk_quotes({"NFO": tokens_to_warm[i:i + 50]})
+    for chunk in itertools.batched(tokens_to_warm, 50):
+        _svc_inst.get_bulk_quotes({"NFO": chunk})
 
 calls = mock_svc.get_bulk_quotes.call_args_list
 check("78 tokens -> exactly 2 bulk calls, not 1", len(calls) == 2, f"{len(calls)} calls")

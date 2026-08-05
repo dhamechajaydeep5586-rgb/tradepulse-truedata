@@ -58,7 +58,7 @@ class Command(BaseCommand):
         if opts["symbols"]:
             symbols = [s.strip().upper() for s in opts["symbols"].split(",") if s.strip()]
         else:
-            from stocks.services.universe_service import get_trading_universe
+            from stocks.services.shared.universe import get_trading_universe
             universe = get_trading_universe(svc)
             symbols = universe.get("symbols") or []
             self.stdout.write(

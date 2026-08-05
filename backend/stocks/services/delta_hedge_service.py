@@ -864,8 +864,8 @@ def build_specialist_hedge(symbol: str, exchange: str, spot_price: float, orch, 
             try:
                 if _svc_inst.streamer:
                     _svc_inst.streamer.subscribe(2, tokens_to_warm)
-                for i in range(0, len(tokens_to_warm), 50):
-                    _svc_inst.get_bulk_quotes({"NFO": tokens_to_warm[i:i + 50]})
+                for chunk in itertools.batched(tokens_to_warm, 50):
+                    _svc_inst.get_bulk_quotes({"NFO": chunk})
             except Exception as w_err:
                 logger.warning("[WARM-UP] Bulk pre-fetch failed: %s", w_err)
 
@@ -1356,8 +1356,8 @@ def build_specialist_hedge(symbol: str, exchange: str, spot_price: float, orch, 
                         rebalance_tokens.append(str(s["token"]))
                 if rebalance_tokens and _svc:
                     logger.info("[REBALANCE_WARMUP] Bulk pre-fetching %d rebalancing options for %s", len(rebalance_tokens), symbol)
-                    for i in range(0, len(rebalance_tokens), 50):
-                        _svc.get_bulk_quotes({exchange: rebalance_tokens[i:i + 50]})
+                    for chunk in itertools.batched(rebalance_tokens, 50):
+                        _svc.get_bulk_quotes({exchange: chunk})
             except Exception as rebal_prefetch_err:
                 logger.warning("[REBALANCE_PREFETCH] Bulk pre-fetch failed: %s", rebal_prefetch_err)
 

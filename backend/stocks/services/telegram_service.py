@@ -36,7 +36,6 @@ def _config() -> dict[str, str]:
         "ENABLED": str(base.get("ENABLED", os.getenv("TELEGRAM_ALERTS_ENABLED", "false"))).strip().lower(),
         "BOT_TOKEN": str(base.get("BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", ""))).strip(),
         "CHAT_ID": str(base.get("CHAT_ID", os.getenv("TELEGRAM_CHAT_ID", ""))).strip(),
-        "DAILY_SUMMARY_ENABLED": str(base.get("DAILY_SUMMARY_ENABLED", os.getenv("TELEGRAM_DAILY_SUMMARY", "true"))).strip().lower(),
     }
 
 

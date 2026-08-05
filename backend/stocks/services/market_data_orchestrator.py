@@ -10,13 +10,6 @@ class MarketDataOrchestrator:
     JD Market Data Orchestrator:
     100% TrueData — no external fallback providers.
     """
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(MarketDataOrchestrator, cls).__new__(cls)
-        return cls._instance
-
     def get_option_data(self, symbol: str, strike: float, option_type: str, expiry: str, exchange: str = "NSE") -> Dict[str, Any] | tuple[Dict[str, Any], str | None]:
         """
         Unified Option Data Layer — TrueData only.

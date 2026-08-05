@@ -533,7 +533,7 @@ def get_live_signals(action: str | None = None) -> dict[str, Any]:
     # Liquidity- and cost-filtered universe. Index membership alone is a market-cap
     # proxy, not a tradability test — a name whose spread exceeds the target is
     # unrunnable regardless of signal quality.
-    from stocks.services.universe_service import get_trading_universe
+    from stocks.services.shared.universe import get_trading_universe
     from stocks.services import candle_store
     _universe = get_trading_universe()
     symbols = _universe.get("symbols") or load_symbols_from_stock_table()
@@ -701,8 +701,8 @@ def get_live_signals(action: str | None = None) -> dict[str, Any]:
             continue
 
     # 3. Score cross-sectionally (0-100), threshold, then apply concentration caps.
-    from stocks.services.ranking_service import score_candidates, apply_threshold
-    from stocks.services.portfolio_risk import (
+    from stocks.services.shared.ranking import score_candidates, apply_threshold
+    from stocks.services.shared.portfolio_risk import (
         build_correlation_clusters, apply_portfolio_constraints, effective_bets,
         compute_betas, beta_constrained, net_portfolio_beta, record_candidates,
     )

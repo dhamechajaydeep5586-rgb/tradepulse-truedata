@@ -20,6 +20,7 @@ All data flows through the new models:
     StockDailyData → TradeScanner → Trade → TelegramLog
 """
 
+import itertools
 import logging
 from datetime import datetime, timedelta, date
 from decimal import Decimal
@@ -532,9 +533,9 @@ def _run_daily_scanner_impl(relaxed: bool = False, send_telegram: bool = True):
 
     tokens = list(token_map.values())
     quotes = {}
-    for i in range(0, len(tokens), 50):
+    for chunk in itertools.batched(tokens, 50):
         try:
-            chunk_q = svc.get_bulk_quotes({"NSE": tokens[i:i+50]}, mode="FULL")
+            chunk_q = svc.get_bulk_quotes({"NSE": chunk}, mode="FULL")
             quotes.update(chunk_q)
         except Exception as e:
             logger.warning("[TRADE_ENGINE] Quote chunk failed: %s", e)
@@ -758,9 +759,9 @@ def run_intraday_check():
 
     tokens = list(token_map.values())
     quotes = {}
-    for i in range(0, len(tokens), 50):
+    for chunk in itertools.batched(tokens, 50):
         try:
-            chunk_q = svc.get_bulk_quotes({"NSE": tokens[i:i+50]}, mode="FULL")
+            chunk_q = svc.get_bulk_quotes({"NSE": chunk}, mode="FULL")
             quotes.update(chunk_q)
         except Exception as e:
             logger.warning("[TRADE_ENGINE] Intraday quote chunk failed: %s", e)
@@ -1746,9 +1747,9 @@ def check_pending_activations():
 
     tokens = list(token_map.values())
     quotes = {}
-    for i in range(0, len(tokens), 50):
+    for chunk in itertools.batched(tokens, 50):
         try:
-            chunk_q = svc.get_bulk_quotes({"NSE": tokens[i:i+50]}, mode="FULL")
+            chunk_q = svc.get_bulk_quotes({"NSE": chunk}, mode="FULL")
             quotes.update(chunk_q)
         except Exception as e:
             logger.warning("[TRADE_ENGINE] Bulk quote fetch failed for activation: %s", e)

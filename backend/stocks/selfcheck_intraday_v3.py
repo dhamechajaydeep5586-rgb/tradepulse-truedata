@@ -118,7 +118,7 @@ if __name__ == "__main__":
     print("=" * 72)
     print("5. BETA CONSTRAINT + P&L ATTRIBUTION (§5.4, v2.0/8)")
     print("=" * 72)
-    from stocks.services.portfolio_risk import (
+    from stocks.services.shared.portfolio_risk import (
         net_portfolio_beta, beta_constrained, attribute_pnl, MAX_NET_BETA,
     )
     betas = {"HIGHB": 1.8, "LOWB": 0.4}

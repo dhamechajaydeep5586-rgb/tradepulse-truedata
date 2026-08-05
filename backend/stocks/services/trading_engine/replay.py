@@ -131,7 +131,7 @@ def rank_per_timestamp(candidates: list[dict], regime, universe_stats: dict,
     Ranking must be scoped to one scan cycle. Scoring the entire history at once would
     let a candidate's percentile depend on setups from months later.
     """
-    from stocks.services.ranking_service import score_candidates, apply_threshold
+    from stocks.services.shared.ranking import score_candidates, apply_threshold
 
     if not candidates:
         return pd.DataFrame()

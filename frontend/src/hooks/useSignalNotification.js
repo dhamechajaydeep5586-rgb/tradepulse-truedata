@@ -81,10 +81,5 @@ export default function useSignalNotification(category = "intraday") {
     }
   }, [permission, category]);
 
-  // Expose an explicit "clear reset" if desired
-  const clearCache = useCallback(() => {
-    notifiedSymbols.current.clear();
-  }, []);
-
-  return { permission, requestPermission, notifyNewSignals, clearCache };
+  return { permission, requestPermission, notifyNewSignals };
 }

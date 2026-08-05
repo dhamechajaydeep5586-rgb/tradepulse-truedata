@@ -15,6 +15,7 @@ ranking model has any signal at all.
 from __future__ import annotations
 
 import io
+import itertools
 import logging
 from datetime import datetime, timedelta
 
@@ -108,9 +109,9 @@ def _spread_bps(svc, token_map: dict[str, str]) -> dict[str, float]:
     """
     tokens = list(token_map.values())
     quotes: dict[str, dict] = {}
-    for i in range(0, len(tokens), 50):
+    for chunk in itertools.batched(tokens, 50):
         try:
-            quotes.update(svc.get_bulk_quotes({"NSE": tokens[i:i + 50]}, mode="FULL"))
+            quotes.update(svc.get_bulk_quotes({"NSE": chunk}, mode="FULL"))
         except Exception as exc:
             logger.debug("[UNIVERSE] Spread quote chunk failed: %s", exc)
 

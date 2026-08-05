@@ -6,6 +6,7 @@ Implements rules for:
 3. Long Term Watchlist (Fundamentals: ROE, Growth, Debt - Top 5 Quality)
 """
 
+import itertools
 import logging
 from typing import Any
 from datetime import datetime, timedelta
@@ -253,8 +254,7 @@ def scan_short_term_stocks() -> list[dict]:
     tokens = list(token_map.values())
     quotes = {}
     chunk_size = 50
-    for i in range(0, len(tokens), chunk_size):
-        chunk = tokens[i:i+chunk_size]
+    for chunk in itertools.batched(tokens, chunk_size):
         try:
             chunk_quotes = svc.get_bulk_quotes({"NSE": chunk}, mode="FULL")
             quotes.update(chunk_quotes)
@@ -407,9 +407,9 @@ def scan_long_term_stocks() -> list[dict]:
 
     tokens = list(token_map.values())
     quotes = {}
-    for i in range(0, len(tokens), 50):
+    for chunk in itertools.batched(tokens, 50):
         try:
-            chunk_q = svc.get_bulk_quotes({"NSE": tokens[i:i + 50]}, mode="FULL")
+            chunk_q = svc.get_bulk_quotes({"NSE": chunk}, mode="FULL")
             quotes.update(chunk_q)
         except Exception as e:
             logger.warning("[LONG_TERM] Quote chunk failed: %s", e)

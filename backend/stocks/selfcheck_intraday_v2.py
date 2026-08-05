@@ -64,7 +64,7 @@ print()
 print("=" * 72)
 print("3. RANKING MODEL (§6.3)")
 print("=" * 72)
-from stocks.services.ranking_service import score_candidates, apply_threshold, FACTOR_WEIGHTS
+from stocks.services.shared.ranking import score_candidates, apply_threshold, FACTOR_WEIGHTS
 check("weights sum to 100", sum(FACTOR_WEIGHTS.values()) == 100, str(sum(FACTOR_WEIGHTS.values())))
 
 cands = [
@@ -93,7 +93,7 @@ print()
 print("=" * 72)
 print("4. PORTFOLIO RISK (§5.3)")
 print("=" * 72)
-from stocks.services.portfolio_risk import (
+from stocks.services.shared.portfolio_risk import (
     apply_portfolio_constraints, effective_bets, volatility_scalar, kelly_fraction,
 )
 n_eff = effective_bets(5, 0.6)

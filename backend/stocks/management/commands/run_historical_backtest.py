@@ -131,7 +131,7 @@ class Command(BaseCommand):
         # ── 2. Replay the strategy over history (no lookahead) ───────────────────
         self.stdout.write(self.style.MIGRATE_HEADING("2. Replaying signal logic"))
         from stocks.services.trading_engine.replay import replay_symbol, rank_per_timestamp
-        from stocks.services.universe_service import get_sector_map
+        from stocks.services.shared.universe import get_sector_map
 
         sectors = get_sector_map()
         all_candidates = []
