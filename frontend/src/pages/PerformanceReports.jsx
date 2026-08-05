@@ -508,10 +508,10 @@ export default function PerformanceReports() {
                         )}
                       </td>
                       <td className="px-5 py-4 font-mono text-gray-400 text-xs">
-                        {s.exit_time || "—"}
+                        {s.exit_price != null ? `₹${s.exit_price.toLocaleString("en-IN", { minimumFractionDigits: 2 })}` : "—"}
                       </td>
-                      <td className="px-5 py-4 text-gray-500 text-xs italic max-w-[280px] whitespace-normal break-words" title={s.reason}>
-                        {s.reason || "—"}
+                      <td className="px-5 py-4 text-gray-500 text-xs italic max-w-[280px] whitespace-normal break-words" title={s.exit_reason}>
+                        {s.exit_reason || "—"}
                       </td>
                     </tr>
                   ))
