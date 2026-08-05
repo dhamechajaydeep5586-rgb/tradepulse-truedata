@@ -64,11 +64,28 @@ class AdminLoginRateLimitMiddleware:
 
     @staticmethod
     def _client_ip(request) -> str:
-        # Trusts X-Forwarded-For because every deploy target for this app sits
-        # behind a real reverse proxy (Render's edge, or the Oracle nginx.conf in
-        # deploy/oracle/) that sets it — matching the assumption Django's own
-        # SECURE_PROXY_SSL_HEADER setting already makes elsewhere in this file.
+        # Fix for a bypass found in a follow-up audit: this used to trust the
+        # FIRST entry in X-Forwarded-For, which is exactly the part of the header
+        # a client controls — a request sent with `X-Forwarded-For: <anything>`
+        # made every attempt look like it came from a different IP, defeating the
+        # lockout entirely (reproduced: 8+ failed attempts, never a 429). Worse,
+        # spoofing a real admin's IP as the first entry let an attacker burn that
+        # admin's IP through the failure count and lock them out on purpose.
+        #
+        # Both deploy targets (Oracle's nginx.conf, Render's edge) sit as exactly
+        # ONE trusted proxy hop in front of this app and APPEND the real
+        # connecting IP as the last entry of X-Forwarded-For (nginx.conf now sets
+        # it to $remote_addr directly, i.e. always a single, real entry) — so the
+        # real client IP is always the LAST hop, never the first, regardless of
+        # what a client puts in its own request. X-Real-IP (nginx-only, set
+        # directly from $remote_addr, never client-influenced) is preferred when
+        # present since it can't be spoofed even in a multi-hop chain.
+        real_ip = request.META.get("HTTP_X_REAL_IP")
+        if real_ip:
+            return real_ip.strip()
         forwarded = request.META.get("HTTP_X_FORWARDED_FOR")
         if forwarded:
-            return forwarded.split(",")[0].strip()
+            hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+            if hops:
+                return hops[-1]
         return request.META.get("REMOTE_ADDR", "unknown")
