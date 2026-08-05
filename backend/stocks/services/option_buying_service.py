@@ -230,6 +230,26 @@ def _live_option_buying_payload() -> dict[str, Any]:
     }
 
 
+def _send_option_buying_exit_alert(sig, exit_price: float, reason: str) -> None:
+    """Instant exit alert, fired from both option-buying close points (normal
+    target/SL/time-stop exit and the daily-loss-limit flatten) — see
+    telegram_service.send_instant_exit_alert's docstring for why this can't wait
+    for the periodic recap."""
+    try:
+        from stocks.services.delta_hedge_service import get_lot_size
+        from stocks.services.telegram_service import send_instant_exit_alert, get_intraday_chat_id
+        lot_size = get_lot_size(sig.symbol, "NSE")
+        qty = lot_size * 2 if lot_size > 0 else 0  # same 2-lot convention as _compute_target_sl
+        send_instant_exit_alert(
+            symbol=f"{sig.symbol} {sig.strike_price} {sig.option_type}",
+            category_label="🎯 Option Buying", signal_type=sig.signal_type,
+            entry=float(sig.entry_price), exit_price=exit_price, qty=qty,
+            reason=reason, chat_id=get_intraday_chat_id(),
+        )
+    except Exception as exc:
+        logger.error("[OPTION_BUYING][EXIT_ALERT] Failed for %s: %s", sig.symbol, exc)
+
+
 def _enforce_option_buying_daily_loss_limit(now_ist: datetime) -> bool:
     """Flatten today's open option_buying positions and halt further generation once
     the day's realised + unrealised P&L breaches the limit — mirrors
@@ -289,6 +309,7 @@ def _enforce_option_buying_daily_loss_limit(now_ist: datetime) -> bool:
         meta["exit_reason"] = "DAILY_LOSS_LIMIT"
         s.metadata = meta
         s.save(update_fields=["status", "exit_price", "exit_time", "metadata"])
+        _send_option_buying_exit_alert(s, exit_px, "DAILY_LOSS_LIMIT")
 
     # Hold the halt until end of day so no later scan reopens positions.
     eod = now_ist.replace(hour=23, minute=59, second=0, microsecond=0)
@@ -357,27 +378,35 @@ def update_option_buying_outcomes() -> None:
                 current_premium = round_to_tick(float(quote["ltp"]))
 
             new_status = None
+            exit_reason = None
             # Pessimistic by design (matches live_signal_service._scan_bars_for_exit): if a
             # single audit tick's premium has crossed both target and stop_loss, book the
             # stop first — resolving the ambiguity in the strategy's own favour would make
             # the P&L record flattering rather than accurate.
             if stop_loss is not None and current_premium <= stop_loss:
                 new_status = SignalHistory.Status.HIT_SL
+                exit_reason = "LEVEL_HIT"
             elif target is not None and current_premium >= target:
                 new_status = SignalHistory.Status.HIT_TARGET
+                exit_reason = "LEVEL_HIT"
             elif past_time_stop:
                 # Hard time-stop: theta decay means every extra minute open is a cost,
                 # regardless of P&L — force-exit at whatever the premium currently is.
                 new_status = SignalHistory.Status.HIT_TARGET if current_premium >= entry_premium else SignalHistory.Status.HIT_SL
+                exit_reason = "TIME_STOP"
 
             if new_status:
                 sig.status = new_status
                 sig.exit_price = current_premium
                 sig.exit_time = datetime.now(tz=IST)
                 sig.premium_cmp = current_premium
-                sig.save(update_fields=["status", "exit_price", "exit_time", "premium_cmp"])
+                meta = sig.metadata or {}
+                meta["exit_reason"] = exit_reason
+                sig.metadata = meta
+                sig.save(update_fields=["status", "exit_price", "exit_time", "premium_cmp", "metadata"])
                 logger.info("[OPTION_BUYING] %s %s exited: status=%s premium %.2f -> %.2f",
                             sig.symbol, sig.option_type, new_status, entry_premium, current_premium)
+                _send_option_buying_exit_alert(sig, current_premium, exit_reason)
             else:
                 sig.premium_cmp = current_premium
                 sig.save(update_fields=["premium_cmp"])

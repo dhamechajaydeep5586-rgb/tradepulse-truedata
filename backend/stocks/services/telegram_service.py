@@ -72,6 +72,52 @@ def get_intraday_chat_id() -> str:
     return str(base.get("INTRADAY_CHAT_ID", os.getenv("TELEGRAM_INTRADAY_CHAT_ID", "784052961"))).strip()
 
 
+_EXIT_REASON_LABEL = {
+    "LEVEL_HIT": "Target/Stop-Loss Hit",
+    "LEVEL_HIT_LTP": "Target/Stop-Loss Hit (degraded, LTP-based)",
+    "TIME_STOP": "Time Stop",
+    "VWAP_EXIT": "VWAP Target Reached",
+    "SQUARE_OFF_CUTOFF": "Session Square-Off",
+    "DAILY_LOSS_LIMIT": "Daily Loss Limit Halt",
+    "EOD_EXPIRY": "End-of-Day (no target/SL touch)",
+    "TREND_BREAK_200EMA": "200-Day EMA Trend Break",
+}
+
+
+def send_instant_exit_alert(
+    *, symbol: str, category_label: str, signal_type: str, entry: float,
+    exit_price: float, qty: float = 0.0, reason: str, chat_id: str | None = None,
+) -> bool:
+    """Fires the moment a position actually closes — separate from (and ahead of)
+    the periodic recap, which only catches up on the next 15-min scan cycle and
+    can lag up to 15 minutes behind the real close. Added 2026-08-05 at the
+    account owner's explicit request: a person placing real manual trades off
+    these signals needs to know to exit NOW, not whenever the next summary
+    happens to mention it.
+
+    `qty=0` (no known position size, e.g. a strangle leg priced in premium
+    space) shows the price move only, not a rupee P&L — better than a fabricated
+    number computed against a share count that never applied to that leg.
+    """
+    if not is_enabled():
+        return False
+    is_buy = signal_type in ("BUY", "BUY_CE", "BUY_PE")
+    direction = 1 if is_buy else -1
+    pnl_pct = ((exit_price - entry) / entry * 100.0 * direction) if entry else 0.0
+    pnl = (exit_price - entry) * qty * direction if qty else None
+    reason_text = _EXIT_REASON_LABEL.get(reason, reason)
+    emoji = "🟢" if (pnl is None or pnl >= 0) else "🔴"
+    pnl_line = f"P&amp;L: {emoji} ₹{pnl:+,.2f} ({pnl_pct:+.2f}%)" if pnl is not None else f"Move: {pnl_pct:+.2f}%"
+    msg = (
+        f"🚨 <b>EXIT NOW — {symbol}</b>\n"
+        f"{category_label}\n"
+        f"Entry: ₹{entry:,.2f} → Exit: ₹{exit_price:,.2f}\n"
+        f"{pnl_line}\n"
+        f"Reason: {reason_text}"
+    )
+    return send_telegram_message(msg, chat_id=chat_id)
+
+
 def send_telegram_message(text: str, parse_mode: str = "HTML", chat_id: str | None = None) -> bool:
     """
     Send a message via Telegram Bot API.
@@ -366,12 +412,44 @@ def maybe_send_telegram_activation(signal) -> bool:
 
 
 
-def maybe_send_telegram_exit(signal, exit_status: str) -> bool:
-    """Send Telegram alert when signal hits TGT or SL (idempotent)."""
-    # Disabled per user request: Only position update messages should go to Telegram.
-    # No SL hit or target hit exit alerts.
-    logger.info("[TELEGRAM] Skipping exit alert for %s (%s) — disabled per user request (intraday mode)", signal.symbol, exit_status)
-    return False
+def maybe_send_telegram_exit(signal, exit_status: str, exit_reason: str | None = None) -> bool:
+    """Instant exit alert for a closed specialist (strangle) signal.
+
+    Re-enabled 2026-08-05 at the account owner's explicit request — a previous
+    request had disabled all specialist exit alerts in favour of only periodic
+    position updates; this now supersedes that, matching the same instant-alert
+    treatment added to every other engine (intraday/option-buying/short-term/
+    long-term) so a person closing the real position doesn't wait up to 15 min
+    for the next periodic recap to mention it.
+
+    Strangle P&L doesn't fit send_instant_exit_alert's single entry/exit-price
+    model (it's net credit collected across two legs, not one instrument), so
+    this builds its own message from the already-computed final_pnl/
+    final_pnl_pct on signal.metadata (set by the caller immediately before this
+    call) instead of recomputing it.
+    """
+    if not is_enabled():
+        return False
+    meta = signal.metadata or {}
+    final_pnl = meta.get('final_pnl')
+    final_pnl_pct = meta.get('final_pnl_pct')
+    if final_pnl is None:
+        logger.warning("[TELEGRAM] Skipping specialist exit alert for %s — no final_pnl on metadata yet", signal.symbol)
+        return False
+    emoji = "🟢" if final_pnl >= 0 else "🔴"
+    status_label = {"HIT_TARGET": "🎯 TARGET HIT", "HIT_SL": "🛑 STOP LOSS HIT", "EXPIRED": "⏰ EXPIRED"}.get(exit_status, exit_status)
+    msg = (
+        f"🚨 <b>EXIT NOW — {signal.symbol} (Strangle)</b>\n"
+        f"Status: {status_label}\n"
+        f"P&amp;L: {emoji} ₹{final_pnl:+,.2f}" + (f" ({final_pnl_pct:+.2f}%)" if final_pnl_pct is not None else "") + "\n"
+        f"Reason: {exit_reason or exit_status}"
+    )
+    success = send_telegram_message(msg)
+    if success:
+        logger.info("[TELEGRAM] Specialist instant exit alert sent for %s (%s)", signal.symbol, exit_status)
+    else:
+        logger.error("[TELEGRAM] Failed to send specialist instant exit alert for %s", signal.symbol)
+    return success
 
 
 def send_daily_picks_summary() -> bool:

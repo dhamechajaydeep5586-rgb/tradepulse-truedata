@@ -3034,7 +3034,7 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
 
                         try:
                             from stocks.services.telegram_service import maybe_send_telegram_exit
-                            maybe_send_telegram_exit(sig, new_status)
+                            maybe_send_telegram_exit(sig, new_status, exit_reason=section.get('exit_reason'))
                         except Exception as tg_err:
                             logger.warning("[TELEGRAM] Failed to send exit alert: %s", tg_err)
                 else:

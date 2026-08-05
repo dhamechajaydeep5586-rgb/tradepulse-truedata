@@ -613,6 +613,22 @@ def update_long_term_outcomes() -> dict[str, Any]:
                 "[LONG_TERM][EXIT] %s closed (%s): close ₹%.2f below 200 EMA ₹%.2f",
                 sig.symbol, new_status, latest_close, ema200,
             )
+            # Instant exit alert — long-term never had ANY Telegram notification before
+            # (no dedicated channel of its own), added 2026-08-05 at the account owner's
+            # explicit request alongside every other engine. No stored qty for this
+            # engine (sizing_mode="inverse_vol", resolved at presentation time, not
+            # persisted), so this reports the % move only rather than a fabricated
+            # rupee P&L. Routed to the short-term channel — the closest existing
+            # precedent in this file (see the "new active setups" send above).
+            try:
+                from stocks.services.telegram_service import send_instant_exit_alert, get_short_term_chat_id
+                send_instant_exit_alert(
+                    symbol=sig.symbol, category_label="🏛️ Long-Term", signal_type="BUY",
+                    entry=entry, exit_price=float(sig.exit_price), qty=0,
+                    reason="TREND_BREAK_200EMA", chat_id=get_short_term_chat_id(),
+                )
+            except Exception as tg_err:
+                logger.error("[LONG_TERM][EXIT_ALERT] Failed for %s: %s", sig.symbol, tg_err)
         except Exception as e:
             logger.error("[LONG_TERM][AUDIT] %s failed: %s", sig.symbol, e)
             continue

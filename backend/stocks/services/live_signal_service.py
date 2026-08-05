@@ -208,7 +208,13 @@ def _scan_bars_for_exit(sig, bars):
 
 
 def _close_signal(sig, status, exit_price, exit_time, reason: str):
-    """Terminal-state a signal and record why it closed."""
+    """Terminal-state a signal and record why it closed.
+
+    Single choke point for every intraday close (LEVEL_HIT, VWAP_EXIT, TIME_STOP,
+    SQUARE_OFF_CUTOFF, DAILY_LOSS_LIMIT) — the instant exit alert below fires from
+    here so no call site can forget it, matching trade_engine.py's _exit_signal()
+    precedent for short-term.
+    """
     sig.status = status
     sig.exit_price = round_to_tick(float(exit_price))
     sig.exit_time = exit_time
@@ -216,6 +222,19 @@ def _close_signal(sig, status, exit_price, exit_time, reason: str):
     meta["exit_reason"] = reason
     sig.metadata = meta
     sig.save()
+
+    # CANCELLED means the signal never activated (still PENDING at cutoff) — there
+    # was no real position to exit, so nothing to alert on.
+    if status != SignalHistory.Status.CANCELLED:
+        try:
+            from stocks.services.telegram_service import send_instant_exit_alert, get_intraday_chat_id
+            send_instant_exit_alert(
+                symbol=sig.symbol, category_label="📊 Intraday", signal_type=sig.signal_type,
+                entry=float(sig.entry_price), exit_price=float(sig.exit_price),
+                qty=float(meta.get("qty") or 0), reason=reason, chat_id=get_intraday_chat_id(),
+            )
+        except Exception as exc:
+            logger.error("[INTRADAY][EXIT_ALERT] Failed for %s: %s", sig.symbol, exc)
 
 
 def _audit_intraday_signal(sig, price, now, svc) -> None:
@@ -431,13 +450,8 @@ def update_signal_outcomes(force: bool = False, action: str | None = None):
 
             # 1. Cutoff Checks
             if sig.category == 'intraday' and now_time >= INTRADAY_SIGNAL_CUTOFF:
-                sig.status = SignalHistory.Status.CANCELLED if sig.status == SignalHistory.Status.PENDING else SignalHistory.Status.EXPIRED
-                sig.exit_price = price
-                sig.exit_time = now
-                meta = sig.metadata or {}
-                meta.setdefault("exit_reason", "SQUARE_OFF_CUTOFF")
-                sig.metadata = meta
-                sig.save()
+                cutoff_status = SignalHistory.Status.CANCELLED if sig.status == SignalHistory.Status.PENDING else SignalHistory.Status.EXPIRED
+                _close_signal(sig, cutoff_status, price, now, "SQUARE_OFF_CUTOFF")
                 continue
 
             # 2. Intraday: audit against 1-min bar highs/lows, with a time stop. Exits
