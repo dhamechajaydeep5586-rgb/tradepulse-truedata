@@ -275,6 +275,41 @@ class TrueDataService:
 
     # --------------------------------------------------------------- quotes
 
+    def _symbolid_to_symbol_map(self) -> dict[str, str]:
+        """{symbolid: symbol name}, built from TrueData's symbol master
+        (getAllSymbols) and cached 24h — symbolids are permanent TrueData-side
+        identifiers, not something that changes intraday.
+
+        Exists solely so get_bulk_quotes can identify which symbol a
+        getLTPBulk response row actually belongs to — see that method's
+        docstring for why this is load-bearing, not defensive extra work.
+        """
+        from django.core.cache import cache as _dj_cache
+        cache_key = "td_symbolid_map_v1"
+        cached = _dj_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        mapping: dict[str, str] = {}
+        self._ensure_fresh_token()
+        for segment in ("eq", "in"):  # eq: stocks, in: indices (NIFTY 50, NIFTY BANK, ...)
+            try:
+                url = f"{MASTER_BASE}/getAllSymbols"
+                params = {"user": self.username, "password": self.password, "segment": segment, "csv": "true"}
+                response = self._rest_request("GET", url, params=params, timeout=30)
+                if response.status_code != 200:
+                    continue
+                for row in csv.DictReader(io.StringIO(response.text.strip())):
+                    sid, sym = row.get("symbolid"), row.get("symbol")
+                    if sid and sym:
+                        mapping[sid] = sym
+            except Exception as e:
+                logger.error("[TRUEDATA] getAllSymbols failed for segment=%s: %s", segment, e)
+
+        if mapping:
+            _dj_cache.set(cache_key, mapping, timeout=86400)
+        return mapping
+
     def get_bulk_quotes(self, exchange_token_map: Dict[str, List[str]], mode: str = "FULL") -> Dict[str, Any]:
         """Fetch quotes for multiple symbols in one call via getLTPBulk.
 
@@ -335,39 +370,47 @@ class TrueDataService:
                 return results
 
             if response.status_code == 200:
-                # getLTPBulk's CSV has no symbol column — rows come back in request
-                # order only, so they must be paired to `to_fetch` by position. A
-                # short or reordered response with no length check silently shifts
-                # every subsequent pairing, misattributing prices for the rest of the
-                # batch with nothing logged. Validate row count first; abort (and log)
-                # the whole batch on any mismatch instead of guessing a partial pairing.
-                rows = list(csv.DictReader(io.StringIO(response.text.strip())))
-                if len(rows) != len(to_fetch):
-                    logger.error(
-                        "[TRUEDATA] BULK_QUOTE_ROW_MISMATCH requested=%d got=%d — "
-                        "aborting batch, refusing to pair by guesswork.",
-                        len(to_fetch), len(rows),
-                    )
-                else:
-                    for (exchange, symbol), row in zip(to_fetch, rows):
-                        ltp = float(row.get("ltp") or row.get("LTP") or 0)
-                        if ltp <= 0:
-                            continue
-                        tick = {
-                            "ltp": ltp,
-                            "high": float(row.get("high", 0) or 0),
-                            "low": float(row.get("low", 0) or 0),
-                            "close": float(row.get("close", 0) or row.get("prevclose", 0) or 0),
-                            "change": float(row.get("change", 0) or 0),
-                            "change_percent": float(row.get("changeper", 0) or row.get("change_percent", 0) or 0),
-                            "trade_volume": float(row.get("volume", 0) or 0),
-                            "open_interest": float(row.get("oi", 0) or 0),
-                            "source": "rest_fallback",
-                            "fetch_time": time.time(),
-                        }
-                        results[f"{exchange}:{symbol}"] = tick
-                        with _STREAM_LOCK:
-                            _STREAM_CACHE[symbol] = tick
+                # CONFIRMED LIVE (2026-08-05): getLTPBulk's CSV rows do NOT come back
+                # in request order — response order tracks something else entirely
+                # (observed: ascending internal symbolid), reproducibly independent of
+                # the order symbols were requested in. The old code here zipped
+                # `to_fetch` against `rows` positionally, which silently cross-wired
+                # prices between symbols whenever request order didn't happen to match
+                # response order — e.g. a request for "ETERNAL,NESTLEIND" got NESTLEIND's
+                # real price attributed to ETERNAL and vice versa, which corrupted a real
+                # position's exit price and falsely tripped the daily loss limit in
+                # production. A row-count check alone (the old guard) can't catch this:
+                # a same-length reordered response sails straight through it.
+                #
+                # Fix: each row has a `symbolid` column (TrueData's own numeric ID, not
+                # a symbol name); resolve it back to the real symbol via the cached
+                # symbol master (_symbolid_to_symbol_map) instead of trusting position.
+                exchange_by_symbol = {symbol: exchange for exchange, symbol in to_fetch}
+                requested_symbols = set(exchange_by_symbol)
+                id_map = self._symbolid_to_symbol_map()
+                for row in csv.DictReader(io.StringIO(response.text.strip())):
+                    symbol = id_map.get(row.get("symbolid", ""))
+                    if not symbol or symbol not in requested_symbols:
+                        continue  # unresolvable or a symbol we never asked for — do not guess
+                    ltp = float(row.get("ltp") or row.get("LTP") or 0)
+                    if ltp <= 0:
+                        continue
+                    exchange = exchange_by_symbol[symbol]
+                    tick = {
+                        "ltp": ltp,
+                        "high": float(row.get("high", 0) or 0),
+                        "low": float(row.get("low", 0) or 0),
+                        "close": float(row.get("close", 0) or row.get("prevclose", 0) or 0),
+                        "change": float(row.get("change", 0) or 0),
+                        "change_percent": float(row.get("changeper", 0) or row.get("change_percent", 0) or 0),
+                        "trade_volume": float(row.get("volume", 0) or 0),
+                        "open_interest": float(row.get("oi", 0) or 0),
+                        "source": "rest_fallback",
+                        "fetch_time": time.time(),
+                    }
+                    results[f"{exchange}:{symbol}"] = tick
+                    with _STREAM_LOCK:
+                        _STREAM_CACHE[symbol] = tick
             else:
                 logger.warning("[TRUEDATA] BULK_QUOTE_HTTP_ERROR status=%s", response.status_code)
         except Exception as e:
