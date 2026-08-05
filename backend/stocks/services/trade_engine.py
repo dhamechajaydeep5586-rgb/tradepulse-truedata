@@ -46,9 +46,85 @@ from stocks.services import candle_store
 # precedent. `cost_model_for(PROFILE)` resolves to DELIVERY_COST_MODEL (STT on both
 # legs, wider spread) rather than the intraday model.
 from stocks.services.trading_engine.cost_model import cost_model_for
-from stocks.services.shared import SWING as PROFILE
+from stocks.services.shared import SWING as PROFILE, allocated_equity
+from stocks.services.shared.risk_engine import position_size
+from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
+
+# Bug fix (found in a follow-up audit): this is the engine actually scheduled live
+# in production today (updater.py: run_daily_scanner at 11:30 AM, run_intraday_check
+# every 30 min, run_eod_evaluation at 3:25 PM) — swing_service.py's V2 rewrite (which
+# DOES have all of this) only runs as a shadow scan with dry_run=True hardcoded and
+# persists nothing, per its own docstring ("requires ~20 sessions of shadow output
+# first" before cutover). This file had none of it: no position sizing anywhere
+# (qty/rupee_risk on ShortTermSignal were always NULL), no cap on how many new
+# PENDING positions one scan run could create, no sector/correlation/promoter-group
+# concentration control, and no daily-loss/drawdown circuit breaker. Position sizing
+# and the drawdown halt below directly reuse shared/risk_engine.py's position_size()
+# and the exact _check_drawdown_halt() pattern already proven in swing_service.py's
+# V2 engine (same ShortTermSignal table, same PROFILE/SWING profile) — not
+# reinvented. Concentration caps reuse shared/portfolio_risk.py, the same machinery
+# intraday_service.py and delta_hedge_service.py already rely on.
+TRADE_ENGINE_DRAWDOWN_HALT_KEY = "trade_engine_drawdown_halt"
+
+# Statuses that represent a live, tracked opportunity for dedup/concentration-cap
+# purposes — matches the existing duplicate-lifecycle check in
+# _run_daily_scanner_impl exactly (kept as one named constant so the two can't
+# silently drift apart).
+TRACKED_LIFECYCLE_STATUSES = [
+    ShortTermSignal.Status.PENDING,
+    ShortTermSignal.Status.ACTIVE,
+    ShortTermSignal.Status.TARGET1,
+    ShortTermSignal.Status.TARGET2,
+    ShortTermSignal.Status.REVIEW_REQUIRED,
+]
+
+# Subset of the above that represents an actually-ENTERED position (excludes
+# PENDING, which hasn't triggered yet and so carries no open P&L) — used for the
+# drawdown halt's open-P&L sum. Matches swing_service.py's HELD_STATUSES exactly.
+HELD_LIFECYCLE_STATUSES = [
+    ShortTermSignal.Status.ACTIVE,
+    ShortTermSignal.Status.TARGET1,
+    ShortTermSignal.Status.TARGET2,
+]
+
+
+def _check_trade_engine_drawdown_halt() -> bool:
+    """Trip a session halt if this engine's open+realised drawdown breaches
+    PROFILE.strategy_drawdown_limit_pct (8% by default). Returns True if the halt
+    is (now, or already) active. Same math as swing_service._check_drawdown_halt —
+    kept as a near-identical copy rather than a shared import so this file's fix
+    doesn't create a coupling to the still-shadow-only V2 engine.
+    """
+    if cache.get(TRADE_ENGINE_DRAWDOWN_HALT_KEY):
+        return True
+
+    limit = PROFILE.strategy_drawdown_limit_pct
+    if not limit:
+        return False
+
+    equity = allocated_equity(PROFILE)
+    if equity <= 0:
+        return False
+
+    open_pnl = 0.0
+    for s in ShortTermSignal.objects.filter(status__in=HELD_LIFECYCLE_STATUSES):
+        if s.pnl_pct and s.qty and s.entry_price:
+            open_pnl += float(s.pnl_pct) / 100.0 * float(s.entry_price) * s.qty
+
+    if (open_pnl / equity) * 100.0 > -limit:
+        return False
+
+    logger.error(
+        "[TRADE_ENGINE][DRAWDOWN_HALT] Open P&L Rs.%.0f is %.1f%% of allocated equity "
+        "Rs.%.0f (limit %.1f%%) — suspending new signal generation for the day.",
+        open_pnl, open_pnl / equity * 100.0, equity, limit,
+    )
+    # Self-expiring, same pattern as every other halt key in this codebase — no
+    # manual reset needed, and a fresh day naturally gets a fresh evaluation.
+    cache.set(TRADE_ENGINE_DRAWDOWN_HALT_KEY, True, timeout=24 * 3600)
+    return True
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STRATEGY CONFIGURATION ENGINE
@@ -411,6 +487,19 @@ def _run_daily_scanner_impl(relaxed: bool = False, send_telegram: bool = True):
 
     logger.info("[TRADE_ENGINE] ═══ Starting Daily Scanner (Relaxed=%s) ═══", relaxed)
 
+    # ── Step 0: Drawdown Halt (audit fix) ──
+    # Must run BEFORE any candidate generation — an open+realised drawdown past
+    # the strategy's own 8% limit is exactly the state where opening more
+    # positions is least justified. Existing open positions are left untouched;
+    # this only stops new ones.
+    try:
+        if _check_trade_engine_drawdown_halt():
+            if send_telegram:
+                _send_telegram_scanner_summary([], {"trend": "HALTED"})
+            return []
+    except Exception as exc:
+        logger.error("[TRADE_ENGINE][DRAWDOWN_HALT] evaluation failed, proceeding: %s", exc)
+
     # ── Step 1: Market Direction ──
     direction = get_market_direction()
     if direction.get('trend') == 'BEARISH' and not relaxed:
@@ -497,6 +586,46 @@ def _run_daily_scanner_impl(relaxed: bool = False, send_telegram: bool = True):
     logger.info("[TRADE_ENGINE] AI scored %d results, matching picks: %s",
                 len(scored_results), [r['symbol'] for r in top_picks])
 
+    # ── Step 6b: Concentration caps + per-scan position cap (audit fix) ──
+    # This engine previously had no sector/correlation/promoter-group control and
+    # no cap on how many new PENDING positions one scan could create — every
+    # candidate that cleared the AI-score filter became a new position, and
+    # apply_portfolio_constraints's max_positions argument (PROFILE.max_positions,
+    # 12 by default) is what actually bounds that count too (it stops accepting
+    # once len(accepted) + len(open_positions) hits the cap), not a separate slice.
+    # Same machinery intraday_service.py / delta_hedge_service.py already use.
+    if top_picks:
+        try:
+            from stocks.services.shared.portfolio_risk import (
+                apply_portfolio_constraints, build_correlation_clusters,
+            )
+            from stocks.services.shared.universe import get_sector_map
+
+            open_positions = list(
+                ShortTermSignal.objects.filter(status__in=TRACKED_LIFECYCLE_STATUSES)
+                .values("symbol")
+            )
+            sector_map = get_sector_map()
+            clusters = build_correlation_clusters(
+                svc, [p["symbol"] for p in top_picks], profile=PROFILE,
+            )
+            accepted, rejected = apply_portfolio_constraints(
+                top_picks, open_positions, sector_map, clusters,
+                PROFILE.max_positions, profile=PROFILE,
+            )
+            if rejected:
+                logger.info(
+                    "[TRADE_ENGINE] Concentration/position caps: %d accepted, %d rejected of %d picks.",
+                    len(accepted), len(rejected), len(top_picks),
+                )
+            top_picks = accepted
+        except Exception as exc:
+            # Fail open on the constraint machinery itself (e.g. a sector CSV
+            # fetch failure) rather than blocking the whole scan — losing this
+            # control for one cycle is far less bad than losing the entire
+            # day's scan to an unrelated data-source hiccup.
+            logger.error("[TRADE_ENGINE] Portfolio constraint check failed, proceeding unfiltered: %s", exc)
+
     # ── Step 7: Create PENDING Trade records ──
     new_trades = []
     for pick in top_picks:
@@ -504,13 +633,7 @@ def _run_daily_scanner_impl(relaxed: bool = False, send_telegram: bool = True):
             # 1. Check duplicate matching lifecycle (PENDING, ACTIVE, TARGET1, TARGET2, REVIEW_REQUIRED)
             existing = ShortTermSignal.objects.filter(
                 symbol=pick['symbol'],
-                status__in=[
-                    ShortTermSignal.Status.PENDING,
-                    ShortTermSignal.Status.ACTIVE,
-                    ShortTermSignal.Status.TARGET1,
-                    ShortTermSignal.Status.TARGET2,
-                    ShortTermSignal.Status.REVIEW_REQUIRED,
-                ]
+                status__in=TRACKED_LIFECYCLE_STATUSES,
             ).exists()
             if existing:
                 logger.info("[TRADE_ENGINE] Skipping %s — already tracked in active lifecycle", pick['symbol'])
@@ -524,6 +647,19 @@ def _run_daily_scanner_impl(relaxed: bool = False, send_telegram: bool = True):
             ).exists()
             if cooldown_active:
                 logger.info("[TRADE_ENGINE] Skipping %s — cooldown lock active", pick['symbol'])
+                continue
+
+            # 3. Risk-parity position sizing (audit fix) — this engine previously
+            # created every qualifying PENDING position with no qty/rupee_risk at
+            # all (both always NULL), so the book had no concept of how much
+            # capital or risk any single position actually carried. Same
+            # position_size() risk_engine.position_size uses for intraday/swing.
+            qty, rupee_risk = position_size(pick['entry_price'], pick['stop_loss'], PROFILE)
+            if qty <= 0:
+                logger.info(
+                    "[TRADE_ENGINE] Skipping %s — position_size produced qty=0 "
+                    "(stop too tight/wide for allocated risk budget)", pick['symbol'],
+                )
                 continue
 
             try:
@@ -541,6 +677,8 @@ def _run_daily_scanner_impl(relaxed: bool = False, send_telegram: bool = True):
                         status=ShortTermSignal.Status.PENDING,
                         expected_holding_days=pick['holding_days'],
                         ai_score=Decimal(str(pick['ai_score'])),
+                        qty=qty,
+                        rupee_risk=Decimal(str(rupee_risk)),
                     )
 
                     # Add creation event to TradeHistory audit log

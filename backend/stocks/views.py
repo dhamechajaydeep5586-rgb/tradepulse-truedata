@@ -362,9 +362,50 @@ class DeltaHedgeView(APIView):
                     except Exception:
                         pass
 
-            # Rank & select: up to 10 equities
+            # Rank candidates by confidence.
             candidate_equities.sort(key=lambda x: x['confidence'], reverse=True)
-            selected = candidate_equities[:10]
+
+            # Audit fix (H3 follow-up): Reset Strategy built its replacement book by
+            # ranking on confidence alone — the same sector/correlation/promoter-group
+            # concentration caps that _background_scan() applies (delta_hedge_service.py)
+            # were never wired in here, so a reset could rebuild the book as ten
+            # correlated names that all breach on the same macro trigger. open_positions
+            # is deliberately empty: this endpoint's whole point is to replace the entire
+            # specialist book in one atomic transaction (phase 2 below), so concentration
+            # is evaluated purely among today's fresh candidates, not against a book that
+            # is about to be cancelled anyway.
+            target_count = getattr(settings, "HEDGE_MAX_SIGNALS", 10)
+            try:
+                from stocks.services.delta_hedge_service import _specialist_portfolio_profile
+                from stocks.services.shared.portfolio_risk import (
+                    apply_portfolio_constraints, build_correlation_clusters,
+                )
+                from stocks.services.shared.universe import get_sector_map
+
+                specialist_profile = _specialist_portfolio_profile()
+                sector_map = get_sector_map()
+                clusters = build_correlation_clusters(
+                    svc, [c["symbol"] for c in candidate_equities], profile=specialist_profile,
+                )
+                accepted, rejected = apply_portfolio_constraints(
+                    candidate_equities, [], sector_map, clusters,
+                    target_count, profile=specialist_profile,
+                )
+                if rejected:
+                    logger.info(
+                        "[RESET][H3] Concentration caps: %d accepted, %d rejected of %d candidates.",
+                        len(accepted), len(rejected), len(candidate_equities),
+                    )
+                candidate_equities = accepted
+            except Exception as pc_err:
+                logger.error("[RESET][H3] Portfolio constraint check failed, proceeding unfiltered: %s", pc_err)
+
+            # Audit fix M7 recurrence: this used to hardcode `[:10]` here, silently
+            # overriding HEDGE_MAX_SIGNALS the same way MAX_EQUITY_SIGNALS did in
+            # delta_hedge_service.py before that fix — raising HEDGE_MAX_SIGNALS in
+            # settings didn't actually raise this endpoint's real cap. Use the same
+            # settings-driven target_count the background scanner uses.
+            selected = candidate_equities[:target_count]
 
             for i, cand in enumerate(selected):
                 try:

@@ -16,11 +16,12 @@ for PYTHON in \
         # Use dynamic PORT from Render, default to 10000 if not set
         PORT="${PORT:-10000}"
         # NOTE: --workers must stay at 1. This app starts an in-process APScheduler
-        # and logs into the Angel One broker session inside apps.py's AppConfig.ready(),
+        # and logs into the TrueData session inside apps.py's AppConfig.ready(),
         # which runs once per OS process — extra worker *processes* would each start
         # their own scheduler (duplicate Telegram alerts, duplicate scheduled scans)
-        # and their own competing Angel One login (broker sessions can only have one
-        # active login). Use threads instead for request concurrency, which share the
+        # and their own competing TrueData login (only one WebSocket session per
+        # login is allowed — a second connection attempt gets "User Already
+        # Connected"). Use threads instead for request concurrency, which share the
         # same process/scheduler/session.
         # NOTE: --timeout 300 (not 60). The in-process APScheduler runs
         # run_periodic_scanners every 15 min, which walks ~500 symbols one-by-one

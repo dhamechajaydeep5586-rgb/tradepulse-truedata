@@ -10,32 +10,47 @@ def _assert_single_gunicorn_worker():
     Audit fix H1. Workers are forked children of the gunicorn master and inherit its
     argv unchanged (no re-exec), so `sys.argv` still shows the original `--workers`/`-w`
     flag inside this worker process — the same assumption the C8 gunicorn-detection
-    check above already relies on. `WEB_CONCURRENCY` is gunicorn's own env-var override
-    for worker count (used instead of `--workers` on some platforms) and takes priority
-    when set, matching gunicorn's own precedence.
+    check above already relies on. `WEB_CONCURRENCY` is gunicorn's own env-var DEFAULT
+    for worker count, used only when `--workers`/`-w` is NOT passed on the command
+    line — NOT an override.
+
+    Bug fix (found in a follow-up audit, verified against the real installed
+    gunicorn package): this used to let WEB_CONCURRENCY unconditionally overwrite
+    an explicit --workers value, which is gunicorn's precedence backwards — real
+    gunicorn always lets an explicit CLI flag win. Both this app's deploy targets
+    hardcode `--workers 1` on the command line, so with the old (wrong) precedence,
+    WEB_CONCURRENCY being set to anything else for ANY unrelated reason (a hosting
+    platform default, a leftover env var from an experiment) made this guard raise
+    on every single boot even though the real gunicorn invocation was completely
+    safe — a false-positive crash loop. Now only consulted when no explicit CLI
+    flag was found, matching gunicorn's actual behavior.
     """
     workers = 1
+    explicit_cli_workers = False
     argv = sys.argv
     for i, arg in enumerate(argv):
         if arg in ("--workers", "-w") and i + 1 < len(argv):
             try:
                 workers = int(argv[i + 1])
+                explicit_cli_workers = True
             except ValueError:
                 pass
             break
         if arg.startswith("--workers="):
             try:
                 workers = int(arg.split("=", 1)[1])
+                explicit_cli_workers = True
             except ValueError:
                 pass
             break
 
-    web_concurrency = os.environ.get("WEB_CONCURRENCY")
-    if web_concurrency:
-        try:
-            workers = int(web_concurrency)
-        except ValueError:
-            pass
+    if not explicit_cli_workers:
+        web_concurrency = os.environ.get("WEB_CONCURRENCY")
+        if web_concurrency:
+            try:
+                workers = int(web_concurrency)
+            except ValueError:
+                pass
 
     if workers > 1:
         raise RuntimeError(

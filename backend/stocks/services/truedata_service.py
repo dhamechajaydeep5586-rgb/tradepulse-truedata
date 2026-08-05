@@ -149,8 +149,26 @@ class TrueDataService:
         """TrueData tokens are valid for `expires_in` seconds (~3.8h) and the
         backend renews the underlying session daily near 4am regardless — if
         we're within 5 minutes of expiry, just re-auth rather than risk a
-        mid-request 401."""
-        if not self.is_authenticated or time.time() > self.token_expires_at - 300:
+        mid-request 401.
+
+        Bug fix (found in a follow-up audit): this used to call
+        self.authenticate() directly, unguarded — called from every REST method
+        (get_candle_data, get_bulk_quotes, get_fo_stocks, etc.), so two threads
+        both deciding the token is near-expiry could both race through
+        authenticate()'s streamer stop-then-replace sequence concurrently,
+        orphaning whichever streamer lost the race — the exact zombie-WebSocket
+        bug the C6 fix was written to prevent, just reachable via a second,
+        unguarded path. CLAUDE.md already states re-auth must go through the
+        same guarded path as initialize_truedata() — this didn't. Now does,
+        via the same module-level _AUTH_LOCK, with the freshness check
+        re-verified inside the lock so a thread that lost the race to a
+        concurrent re-auth doesn't redundantly authenticate a second time.
+        """
+        if self.is_authenticated and time.time() <= self.token_expires_at - 300:
+            return
+        with _AUTH_LOCK:
+            if self.is_authenticated and time.time() <= self.token_expires_at - 300:
+                return  # another thread already refreshed it while we waited
             self.authenticate()
 
     def _rest_request(self, method: str, url: str, **kwargs) -> requests.Response:

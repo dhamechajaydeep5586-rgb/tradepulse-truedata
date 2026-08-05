@@ -1,5 +1,6 @@
 from typing import List, Dict, Any
 import logging
+import threading
 from django.utils import timezone
 from datetime import timedelta, datetime, time
 import pandas as pd
@@ -35,6 +36,33 @@ from stocks.services.risk_state_engine import classify_risk_state, RiskState
 from stocks.services.vol_telegram_formatter import format_entry_signal, format_live_update
 
 logger = logging.getLogger(__name__)
+
+# Audit fix (race condition found in a follow-up audit): process_legs() does a
+# classic read-modify-write against a SignalHistory row — fetch `sig`, mutate its
+# status/metadata/legs across ~400 lines of exit/rebalance logic, then sig.save() —
+# with no locking. Force Scan (bypasses the panel's 2s/5s caches, runs process_legs
+# inline on the request thread) can overlap with the background scanner's own
+# periodic monitor pass for the SAME signal. This app runs as a single gunicorn
+# worker with N gthreads (see stocks/apps.py's single-worker guard), so all real
+# concurrency here is in-process threads — a plain per-signal threading.Lock fully
+# serializes it. Without this, whichever thread's sig.save() lands last silently
+# discards the other thread's changes (a delta rebalance roll, a target/SL exit,
+# updated P&L) — a lost-update bug. Same double-checked-lock-per-key idiom already
+# used for TrueData auth (_AUTH_LOCK / _ensure_fresh_token in truedata_service.py).
+_SIGNAL_LOCKS: Dict[int, threading.Lock] = {}
+_SIGNAL_LOCKS_GUARD = threading.Lock()
+
+
+def _get_signal_lock(sig_id) -> threading.Lock:
+    lock = _SIGNAL_LOCKS.get(sig_id)
+    if lock is None:
+        with _SIGNAL_LOCKS_GUARD:
+            lock = _SIGNAL_LOCKS.get(sig_id)
+            if lock is None:
+                lock = threading.Lock()
+                _SIGNAL_LOCKS[sig_id] = lock
+    return lock
+
 
 # Volatility (Sigma) Parameters
 DEFAULT_STOCK_SIGMA = 0.25
@@ -76,8 +104,8 @@ def _specialist_portfolio_profile():
 # behavior does not silently change until this is set deliberately.
 HEDGE_ACCOUNT_CAPITAL = float(getattr(settings, "HEDGE_ACCOUNT_CAPITAL", 10_000_000.0))
 
-# MAX_PORTFOLIO_HEAT_PCT: additive gate alongside the existing flat position-count caps
-# (HEDGE_MAX_SIGNALS / MAX_EQUITY_SIGNALS below) — once portfolio_heat_pct reaches this
+# MAX_PORTFOLIO_HEAT_PCT: additive gate alongside the existing flat position-count cap
+# (HEDGE_MAX_SIGNALS below) — once portfolio_heat_pct reaches this
 # threshold, the background scanner skips opening any NEW strangle position for the scan
 # cycle, even if count-based slots remain open. Does not touch existing open positions and
 # does not affect the dashboard display path. Settings-overridable, same pattern as
@@ -2232,7 +2260,7 @@ def get_hedge_panel_data(action: str | None = None, sync_scan: bool = False) -> 
         # Scan strictly runs when resolved_action == "generate"
         if resolved_action == "generate" and not scanner_throttled and now_ist >= ENTRY_WINDOW_START:
             # PORTFOLIO-HEAT GATE (Audit Remediation Plan Phase 2 #2.8) — additive to the
-            # flat position-count caps (HEDGE_MAX_SIGNALS / MAX_EQUITY_SIGNALS inside
+            # flat position-count cap (HEDGE_MAX_SIGNALS / target_count inside
             # _background_scan), not a replacement. Reuses the same portfolio_heat value just
             # computed for the display metric above, so the gate and the dashboard can never
             # disagree. Only blocks opening NEW positions — existing open positions, exits,
@@ -2651,400 +2679,401 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
         # down raise UnboundLocalError on any call with persist_updates=False (or
         # sig_id=None) that reached that check — dormant in production today only
         # because the single live call site always passes persist_updates=True.
-        try:
-            sig = SignalHistory.objects.get(id=sig_id)
-            current_metadata = sig.metadata or {}
-            current_metadata['legs'] = updated_legs
-            
-            # Transition overall signal status based on legs
-            new_status = sig.status
-            
-            # --- C. TIME-BASED EXIT (EXIT_TIME / 3:25 PM NSE Auto-Square-Off) ---
-            # Re-enabled — previously disabled per an earlier user request, which left
-            # equity strangles sitting ACTIVE indefinitely past market close instead of
-            # resolving same-day like every other category.
-            # Just sets new_status here — the "AGGREGATE NET P&L RECORDING" block further
-            # down (triggered by is_closing and was_active) locks final_pnl/final_pnl_pct
-            # from these same mark-to-market updated_legs once new_status is EXPIRED, so
-            # that computation doesn't need to be duplicated here.
-            now_ist_time = timezone.now().astimezone(IST).time()
-            if sig.status in [SignalHistory.Status.ACTIVE, SignalHistory.Status.PENDING]:
-                if now_ist_time >= EXIT_TIME:
-                    if sig.status == SignalHistory.Status.ACTIVE:
-                        for l in updated_legs:
-                            l['status'] = 'EXPIRED'
-                        new_status = SignalHistory.Status.EXPIRED
-                        section['status'] = 'EXPIRED'
-                        logger.info("[EOD_SQUARE_OFF] Auto-closing %s at %s IST (mark-to-market)", symbol, EXIT_TIME)
-                    else:  # PENDING — never activated, no P&L
-                        new_status = SignalHistory.Status.CANCELLED
-                        section['status'] = 'CANCELLED'
-                        logger.info("[EOD_SQUARE_OFF] Auto-cancelled PENDING %s at %s IST (never activated)", symbol, EXIT_TIME)
-
-            
-            # A. Entry: PENDING → ACTIVE with Grace Window
-            # Signals stay PENDING for PENDING_GRACE_SECONDS after creation so users
-            # have time to see and enter the trade. During grace, entry price floats
-            # to CMP. After grace, auto-activate with current CMP as the real entry.
-            # just_activated tracks a same-tick PENDING -> ACTIVE -> HIT_TARGET/HIT_SL
-            # transition (fast-moving stock breaches target/SL right as grace expires,
-            # before ever being recorded ACTIVE in a prior tick) — see its use in the
-            # "was_active" check below, which otherwise reads sig.status from BEFORE
-            # this call and would wrongly treat the position as never having been open.
-            just_activated = False
-            if sig.status == SignalHistory.Status.PENDING and all(l.get('cmp', 0) > 0 for l in updated_legs):
-                age_seconds = (timezone.now() - sig.generated_at).total_seconds()
-                grace_remaining = max(0, PENDING_GRACE_SECONDS - age_seconds)
-                
-                if grace_remaining > 0:
-                    # Still in grace window: float entry price to live CMP
-                    # so the user sees what they would actually pay right now.
-                    # NOTE: original_sell_price is intentionally preserved — it reflects
-                    # the price shown in the initial signal notification and must never change.
-                    for l in updated_legs:
-                        curr_cmp = float(l.get('cmp', 0))
-                        if curr_cmp > 0:
-                            l['sell_price'] = curr_cmp
-                            # Preserve original_sell_price (immutable entry for Telegram updates)
-                            if not l.get('original_sell_price'):
-                                l['original_sell_price'] = curr_cmp
-                            # Re-calculate target, stop loss, and PNL with new sell_price
-                            l['target_price'] = round_to_tick(curr_cmp * 0.70, 0.05)
-                            l['stop_loss_price'] = round_to_tick(curr_cmp * 1.15, 0.05)
-                            # Fall back to this leg's own known-good lot_size on a failed
-                            # fresh lookup instead of overwriting it (audit fix H18).
-                            ls = get_lot_size(symbol, l.get('exchange', 'NSE')) or l.get('lot_size', 0)
-                            calculated = calculate_pnl(l['sell_price'], l['cmp'], ls, 1)
-                            calculated['lot_size'] = ls
-                            l.update(calculated)
-                            # Restore original_sell_price in case calculate/update clobbered it
-                            if 'original_sell_price' not in l or not l['original_sell_price']:
-                                l['original_sell_price'] = l['sell_price']
-
-                            # Reset cached baseline so it picks up the new price on activation
-                            cache_suffix = f"_{sig_id}" if sig_id else ""
-                            float_cache_key = f"specialist_baseline_{symbol}_{l['strike']}_{l['option_type']}{cache_suffix}"
-                            cache.set(float_cache_key, curr_cmp, 60 * 60 * 24)
-                    
-                    section['status'] = 'PENDING'
-                    # Recalculate section_pnl from updated leg pnls to prevent ghost P&L leaking
-                    section['section_pnl'] = sum(float(l.get('pnl', 0)) for l in updated_legs)
-                    
-                    grace_min = int(grace_remaining // 60)
-                    grace_sec = int(grace_remaining % 60)
-                    logger.debug("[STRATEGY] Signal %s in grace period (%dm %ds remaining)", sig_id, grace_min, grace_sec)
-                else:
-                    # Grace expired: lock current CMP as the real entry price and activate.
-                    # NOTE: original_sell_price is intentionally preserved — it must stay as
-                    # the price originally shown in the signal notification (pre-grace).
-                    for l in updated_legs:
-                        curr_cmp = float(l.get('cmp', 0))
-                        if curr_cmp > 0:
-                            # Snapshot original_sell_price before overwriting sell_price
-                            if not l.get('original_sell_price'):
-                                l['original_sell_price'] = float(l.get('sell_price', curr_cmp))
-                            l['sell_price'] = curr_cmp
-                            # Re-calculate target, stop loss, and PNL with new sell_price
-                            l['target_price'] = round_to_tick(curr_cmp * 0.70, 0.05)
-                            l['stop_loss_price'] = round_to_tick(curr_cmp * 1.15, 0.05)
-                            # Fall back to this leg's own known-good lot_size on a failed
-                            # fresh lookup instead of overwriting it (audit fix H18).
-                            ls = get_lot_size(symbol, l.get('exchange', 'NSE')) or l.get('lot_size', 0)
-                            calculated = calculate_pnl(l['sell_price'], l['cmp'], ls, 1)
-                            calculated['lot_size'] = ls
-                            l.update(calculated)
-                            # Restore original_sell_price after dict update
-                            if not l.get('original_sell_price'):
-                                l['original_sell_price'] = l['sell_price']
-
-                            cache_suffix = f"_{sig_id}" if sig_id else ""
-                            lock_cache_key = f"specialist_baseline_{symbol}_{l['strike']}_{l['option_type']}{cache_suffix}"
-                            cache.set(lock_cache_key, curr_cmp, 60 * 60 * 24)
-                    
-                    new_status = SignalHistory.Status.ACTIVE
-                    just_activated = True
-                    section['status'] = 'ACTIVE'
-                    # Recalculate section_pnl from updated leg pnls to prevent ghost P&L leaking
-                    section['section_pnl'] = sum(float(l.get('pnl', 0)) for l in updated_legs)
-                    
-                    logger.info("[STRATEGY] Signal %s moved PENDING -> ACTIVE (Grace expired, entry locked at live CMP)", sig_id)
-                    # Telegram: Alert for signal activation (now disabled per user request, but keeping the try block structure)
-                    try:
-                        from stocks.services.telegram_service import maybe_send_telegram_activation
-                        maybe_send_telegram_activation(sig)
-                    except Exception as tg_err:
-                        logger.warning("[TELEGRAM] Failed to send activation alert: %s", tg_err)
-            
-            # B. Exits: Check for TGT/SL Hits (ONLY for ACTIVE orders)
-            any_sl = False
-            all_tgt = False
-            is_equity = True  # MCX removed platform-wide — every specialist signal is now NSE equity
-            
-            if sig.status == SignalHistory.Status.ACTIVE or new_status == SignalHistory.Status.ACTIVE:
-                # Per-leg status logic refinement (Check against TGT/SL)
-                for l in updated_legs:
-                    entry = float(l.get('sell_price', 0))
-                    cmp_now = float(l.get('cmp', 0))
-                    tgt = float(l.get('target_price', 0))
-                    sl = float(l.get('stop_loss_price', 0))
-                    
-                    # Prevent re-evaluating already completed legs. EXPIRED (rolled-away by
-                    # rebalance_delta_neutral_strangle) must stay terminal too — otherwise the
-                    # unconditional `is_equity` branch below resets it back to WAITING every
-                    # cycle, which both re-enables quote drift on a dead leg and makes
-                    # rebalance's `len(active_legs) != 2` check see 3 WAITING legs and bail out.
-                    if l.get('status') in ['HIT_TARGET', 'HIT_SL', 'EXPIRED']:
-                        continue
-
-                    # SCALE MISMATCH GUARD: entry and cmp are both sourced from the same
-                    # normalized quote pipeline (truedata_streamer divides WS ticks by 100
-                    # paise->Rupees; truedata_service's REST /quote path is already Rupees,
-                    # for every exchange including NFO) — see investigation notes in
-                    # AUDIT_REMEDIATION_PLAN.md item 7. Root cause traced to the now-deleted
-                    # MCX quote path (removed platform-wide 2026-07-24); no remaining code path
-                    # was found that double-scales a live NFO option premium. Given that, a
-                    # >2.5x jump here is far more likely to be a genuine large adverse move
-                    # (real loss for the seller) than a leftover unit bug — auto-dividing it by
-                    # 100 would silently turn a real loss into a false "win". Previously this
-                    # block did exactly that (divided cmp_now by a factor of 100); it now fails
-                    # safe instead: flag the leg theoretical/suspect and skip its exit check. Both
-                    # the per-leg elif below and the combined-premium systematic check further
-                    # down respect is_theoretical.
-                    if entry < 200 and cmp_now > 500:
-                        logger.error(
-                            "[SCALE_MISMATCH] %s %s %s entry=%.2f cmp=%.2f — flagging theoretical, no auto-exit.",
-                            sig.symbol, l.get('strike'), l.get('option_type'), entry, cmp_now
-                        )
-                        l['is_theoretical'] = True
-                        alert_key = f"scale_mismatch_alert_{sig_id}_{l.get('strike')}_{l.get('option_type')}"
-                        if not cache.get(alert_key):
-                            cache.set(alert_key, True, 60 * 15)  # throttle: once per 15 min per leg
-                            try:
-                                from stocks.services.telegram_service import send_telegram_message
-                                send_telegram_message(
-                                    f"⚠️ <b>SCALE MISMATCH — {sig.symbol}</b>\n"
-                                    f"Leg {l.get('option_type')} {l.get('strike')}: entry=₹{entry:.2f} cmp=₹{cmp_now:.2f}\n"
-                                    f"Auto-exit suppressed pending manual review."
-                                )
-                            except Exception as tg_err:
-                                logger.warning("[SCALE_MISMATCH] Telegram alert failed: %s", tg_err)
-                        continue
-                    
-                    # Equities bypass single-leg exits, but still check systematic strangle
-                    # overlays below (per-leg TGT/SL branch removed post-MCX removal — every
-                    # specialist signal is NSE equity now, so this was the only reachable path).
-                    l['status'] = 'WAITING'
-                
-                # --- INSTITUTIONAL SYSTEMATIC RISK ENGINE OVERLAYS ---
-                # Exclude EXPIRED (rolled-away) legs: a symbol that has been through a delta
-                # rebalance has 3+ SELL-action legs in metadata (old rolled leg + live one),
-                # and this overlay is only meaningful across the two currently-live legs.
-                sell_legs = [l for l in updated_legs if l.get('action') == 'SELL' and l.get('status') != 'EXPIRED']
-                if len(sell_legs) == 2:
-                    ce_leg = next((l for l in sell_legs if l.get('option_type') == 'CE'), None)
-                    pe_leg = next((l for l in sell_legs if l.get('option_type') == 'PE'), None)
-
-                    # GHOST/SCALE PROTECTION: this combined-premium block is the *actual* live
-                    # exit path for every current specialist signal (all NSE equity — see
-                    # `is_equity = True` above), since that hardcode makes the single-leg
-                    # `elif ... not l.get('is_theoretical')` guard just above unreachable. Skip
-                    # the systematic SL/target/profit-capture math entirely if either leg is
-                    # flagged theoretical (self-healing WAF fallback, or SCALE_MISMATCH above)
-                    # — otherwise a suspect price still reaches HIT_TARGET/HIT_SL undetected.
-                    if (ce_leg and pe_leg and ce_leg.get('cmp', 0) > 0 and pe_leg.get('cmp', 0) > 0
-                            and not ce_leg.get('is_theoretical', False) and not pe_leg.get('is_theoretical', False)):
-                        ce_entry = float(ce_leg.get('original_sell_price', 0) or ce_leg.get('sell_price', 0))
-                        pe_entry = float(pe_leg.get('original_sell_price', 0) or pe_leg.get('sell_price', 0))
-                        
-                        entry_combined = ce_entry + pe_entry
-                        current_combined = float(ce_leg.get('cmp', 0)) + float(pe_leg.get('cmp', 0))
-                        
-                        # Theta Capture Percentage
-                        theta_capture_pct = 0.0
-                        if entry_combined > 0:
-                            theta_capture_pct = ((entry_combined - current_combined) / entry_combined) * 100.0
-                        
-                        # Premium Expansion Percentage
-                        premium_expansion_pct = 0.0
-                        if entry_combined > 0:
-                            premium_expansion_pct = ((current_combined - entry_combined) / entry_combined) * 100.0
-                            
-                        ce_delta = abs(float(ce_leg.get('delta', 0.0) or 0.0))
-                        pe_delta = abs(float(pe_leg.get('delta', 0.0) or 0.0))
-                        max_short_delta = max(ce_delta, pe_delta)
-
-                        # Audit fix (C4): physical-settlement/assignment-risk warning,
-                        # distinct from and earlier than the delta-danger auto-exit
-                        # below — informational only, does not itself close the
-                        # position. Index legs (cash-settled) never carry this risk.
-                        assignment_risk = is_physical_settlement_risk(sig.symbol, max_short_delta)
-                        section['assignment_risk'] = assignment_risk
-                        sig.metadata['assignment_risk'] = assignment_risk
-                        if assignment_risk:
-                            logger.warning(
-                                "[ASSIGNMENT_RISK] %s is a physically-settled stock option nearing ITM "
-                                "(delta=%.2f) — a short leg that drifts/gaps ITM before expiry can be "
-                                "assigned, obligating physical delivery rather than cash settlement.",
-                                sig.symbol, max_short_delta,
-                            )
-
-                        # Classify dynamic risk state
-                        risk_state = classify_risk_state(premium_expansion_pct, max_short_delta)
-                        section['risk_state'] = risk_state.value
-                        sig.metadata['risk_state'] = risk_state.value
-                        sig.metadata['theta_capture_pct'] = round(theta_capture_pct, 2)
-
-                        # Detect whether this is an intraday-flagged signal
-                        _is_intraday = any(l.get('is_intraday') for l in sell_legs)
-
-                        # Choose exit thresholds: intraday (fast) vs monthly (conservative)
-                        if _is_intraday:
-                            _sl_mult = INTRADAY_COMBINED_SL_MULT           # 1.25 (+25%)
-                            # Use early fast-capture if near expiry (DTE ≤ 3)
-                            try:
-                                _exp_str = ce_leg.get('expiry', '')
-                                _today_dt = timezone.now().astimezone(IST).date()
-                                _exp_dt = datetime.strptime(_exp_str, "%d%b%Y").date()
-                                _dte_now = (_exp_dt - _today_dt).days
-                            except Exception:
-                                _dte_now = 99
-                            _capture_pct = INTRADAY_PROFIT_CAPTURE_EARLY if _dte_now <= 3 else INTRADAY_PROFIT_CAPTURE_PCT
-                        else:
-                            _sl_mult = COMBINED_SL_MULTIPLIER               # 1.30 (+30%)
-                            _capture_pct = PROFIT_CAPTURE_PCT               # 0.80 (80% decay)
-
-                        # A. Combined Premium Stop Loss Check
-                        if current_combined >= entry_combined * _sl_mult:
-                            logger.warning(
-                                "[SYSTEMATIC_SL] %s SL: \u20b9%.2f >= \u20b9%.2f (%.0f%% expansion) | mode=%s",
-                                sig.symbol, current_combined, entry_combined * _sl_mult,
-                                premium_expansion_pct, "INTRADAY" if _is_intraday else "MONTHLY"
-                            )
-                            new_status = SignalHistory.Status.HIT_SL
-                            section['status'] = 'SL HIT'
-                            section['exit_reason'] = f"Combined Premium SL ({'+' if _is_intraday else '+'}{ int((_sl_mult-1)*100)}%)"
-
-                        # B. Profit Capture / Theta Decay Booking Check
-                        elif current_combined <= entry_combined * (1.0 - _capture_pct):
-                            logger.info(
-                                "[SYSTEMATIC_TP] %s Target: \u20b9%.2f <= \u20b9%.2f (%.0f%% decay) | mode=%s | capture=%.0f%%",
-                                sig.symbol, current_combined, entry_combined * (1.0 - _capture_pct),
-                                theta_capture_pct, "INTRADAY" if _is_intraday else "MONTHLY",
-                                _capture_pct * 100
-                            )
-                            new_status = SignalHistory.Status.HIT_TARGET
-                            section['status'] = 'TARGET HIT'
-                            section['exit_reason'] = "Systematic Profit Capture"
-                            
-                        # C. Delta Danger auto-exit Check
-                        elif max_short_delta >= SHORT_DELTA_DANGER and AUTO_EXIT_ON_DELTA_BREACH:
-                            logger.warning("[DELTA_BREACH_EXIT] Auto-exiting %s: Delta %.2f exceeds danger threshold %.2f", sig.symbol, max_short_delta, SHORT_DELTA_DANGER)
-                            new_status = SignalHistory.Status.HIT_SL
-                            section['status'] = 'SL HIT'
-                            section['exit_reason'] = f"Delta Breach (Delta={max_short_delta:.2f})"
-                            
-                        # D. Expiry Force-Exit DTE Guard
-                        today_dt = timezone.now().astimezone(IST).date()
-                        exp_date_str = ce_leg.get('expiry')
-                        if exp_date_str:
-                            try:
-                                exp_dt = datetime.strptime(exp_date_str, "%d%b%Y").date()
-                                dte = (exp_dt - today_dt).days
-                                if dte <= FORCE_EXIT_DTE:
-                                    logger.warning("[EXPIRY_CLOSEOUT] Force-closing %s strangle: DTE is %d <= %d day threshold", sig.symbol, dte, FORCE_EXIT_DTE)
-                                    new_status = SignalHistory.Status.EXPIRED
-                                    section['status'] = 'EXPIRED'
-                                    section['exit_reason'] = f"Expiry Force-Exit (DTE={dte})"
-                            except Exception as dte_err:
-                                logger.error(f"[DTE_ERROR] Failed to parse expiry date: {dte_err}")
-
-                # Check for overall signal completion (equities only — MCX's "Option B" all-legs
-                # branch removed platform-wide; every specialist signal is NSE equity now).
-                if new_status in [SignalHistory.Status.HIT_SL, SignalHistory.Status.HIT_TARGET, SignalHistory.Status.EXPIRED]:
-                    # Direct closure logic for equities
-                    final_pnl = sum([float(lf.get('pnl', 0)) for lf in updated_legs])
-                    # Audit fix M9: only the currently-live legs' entry value belongs in the
-                    # % denominator — a rolled-away (EXPIRED) leg's original sell_price
-                    # inflates it, understating the true % return on a rolled position (the
-                    # rupee final_pnl above is already correct, since a frozen leg's pnl was
-                    # locked at its actual realized value when it was rolled).
-                    total_entry_val = sum([
-                        float(lf.get('sell_price', 0)) * int(lf.get('lot_size', 1))
-                        for lf in updated_legs if lf.get('status') != 'EXPIRED'
-                    ])
-                    final_pnl_pct = (final_pnl / total_entry_val * 100) if total_entry_val > 0 else 0
-
-                    sig.metadata['final_pnl'] = round(final_pnl, 2)
-                    sig.metadata['final_pnl_pct'] = round(final_pnl_pct, 2)
-
-                    try:
-                        from stocks.services.telegram_service import maybe_send_telegram_exit
-                        maybe_send_telegram_exit(sig, new_status)
-                    except Exception as tg_err:
-                        logger.warning("[TELEGRAM] Failed to send exit alert: %s", tg_err)
-            else:
-                # Still PENDING: Keep legs in WAITING status until touched
-                for l in updated_legs:
-                    l['status'] = 'WAITING'
-            
-            # Sync section status with final confirmed status
-            if new_status == SignalHistory.Status.ACTIVE:
-                section['status'] = 'ACTIVE'
-            
-            # Commit Updates
-            if persist_updates:
-                # --- RUN DELTA NEUTRAL REBALANCING (ROLLING) ---
-                if sig.status == SignalHistory.Status.ACTIVE:
-                    rebalance_delta_neutral_strangle(sig, updated_legs, underlying_spot, sig_exchange, orch)
-                    
+        with _get_signal_lock(sig_id):
+            try:
+                sig = SignalHistory.objects.get(id=sig_id)
+                current_metadata = sig.metadata or {}
                 current_metadata['legs'] = updated_legs
-                sig.metadata = current_metadata
-                
-                # --- AGGREGATE NET P&L RECORDING ---
-                # Only lock in the P&L if we are transitioning from ACTIVE to a closed state.
-                # was_active also covers a same-tick PENDING -> ACTIVE -> closed transition
-                # (just_activated) — without it, a fast move that breaches target/SL right as
-                # grace expires would skip this block (sig.status here still reads the PENDING
-                # value from before this call) and permanently lock final_pnl at 0.0.
-                is_closing = new_status in [SignalHistory.Status.HIT_SL, SignalHistory.Status.HIT_TARGET, SignalHistory.Status.EXPIRED, SignalHistory.Status.CANCELLED]
-                was_active = (sig.status == SignalHistory.Status.ACTIVE) or just_activated
-                
-                if is_closing and was_active:
-                    final_pnl = sum([float(l.get('pnl', 0)) for l in updated_legs])
-                    # Audit fix M9: exclude rolled-away (EXPIRED) legs from the % denominator
-                    # — see the matching comment on the equities-only branch above.
-                    total_entry_val = sum([
-                        float(l.get('sell_price', 0)) * int(l.get('lot_size', 1))
-                        for l in updated_legs if l.get('status') != 'EXPIRED'
-                    ])
-                    final_pnl_pct = (final_pnl / total_entry_val * 100) if total_entry_val > 0 else 0
+            
+                # Transition overall signal status based on legs
+                new_status = sig.status
+            
+                # --- C. TIME-BASED EXIT (EXIT_TIME / 3:25 PM NSE Auto-Square-Off) ---
+                # Re-enabled — previously disabled per an earlier user request, which left
+                # equity strangles sitting ACTIVE indefinitely past market close instead of
+                # resolving same-day like every other category.
+                # Just sets new_status here — the "AGGREGATE NET P&L RECORDING" block further
+                # down (triggered by is_closing and was_active) locks final_pnl/final_pnl_pct
+                # from these same mark-to-market updated_legs once new_status is EXPIRED, so
+                # that computation doesn't need to be duplicated here.
+                now_ist_time = timezone.now().astimezone(IST).time()
+                if sig.status in [SignalHistory.Status.ACTIVE, SignalHistory.Status.PENDING]:
+                    if now_ist_time >= EXIT_TIME:
+                        if sig.status == SignalHistory.Status.ACTIVE:
+                            for l in updated_legs:
+                                l['status'] = 'EXPIRED'
+                            new_status = SignalHistory.Status.EXPIRED
+                            section['status'] = 'EXPIRED'
+                            logger.info("[EOD_SQUARE_OFF] Auto-closing %s at %s IST (mark-to-market)", symbol, EXIT_TIME)
+                        else:  # PENDING — never activated, no P&L
+                            new_status = SignalHistory.Status.CANCELLED
+                            section['status'] = 'CANCELLED'
+                            logger.info("[EOD_SQUARE_OFF] Auto-cancelled PENDING %s at %s IST (never activated)", symbol, EXIT_TIME)
 
-                    sig.metadata['final_pnl'] = round(final_pnl, 2)
-                    sig.metadata['final_pnl_pct'] = round(final_pnl_pct, 2)
-                    logger.info("[STRATEGY] Locked Net P&L for %s: Rs.%.2f (%.2f%%)", sig.symbol, final_pnl, final_pnl_pct)
+            
+                # A. Entry: PENDING → ACTIVE with Grace Window
+                # Signals stay PENDING for PENDING_GRACE_SECONDS after creation so users
+                # have time to see and enter the trade. During grace, entry price floats
+                # to CMP. After grace, auto-activate with current CMP as the real entry.
+                # just_activated tracks a same-tick PENDING -> ACTIVE -> HIT_TARGET/HIT_SL
+                # transition (fast-moving stock breaches target/SL right as grace expires,
+                # before ever being recorded ACTIVE in a prior tick) — see its use in the
+                # "was_active" check below, which otherwise reads sig.status from BEFORE
+                # this call and would wrongly treat the position as never having been open.
+                just_activated = False
+                if sig.status == SignalHistory.Status.PENDING and all(l.get('cmp', 0) > 0 for l in updated_legs):
+                    age_seconds = (timezone.now() - sig.generated_at).total_seconds()
+                    grace_remaining = max(0, PENDING_GRACE_SECONDS - age_seconds)
+                
+                    if grace_remaining > 0:
+                        # Still in grace window: float entry price to live CMP
+                        # so the user sees what they would actually pay right now.
+                        # NOTE: original_sell_price is intentionally preserved — it reflects
+                        # the price shown in the initial signal notification and must never change.
+                        for l in updated_legs:
+                            curr_cmp = float(l.get('cmp', 0))
+                            if curr_cmp > 0:
+                                l['sell_price'] = curr_cmp
+                                # Preserve original_sell_price (immutable entry for Telegram updates)
+                                if not l.get('original_sell_price'):
+                                    l['original_sell_price'] = curr_cmp
+                                # Re-calculate target, stop loss, and PNL with new sell_price
+                                l['target_price'] = round_to_tick(curr_cmp * 0.70, 0.05)
+                                l['stop_loss_price'] = round_to_tick(curr_cmp * 1.15, 0.05)
+                                # Fall back to this leg's own known-good lot_size on a failed
+                                # fresh lookup instead of overwriting it (audit fix H18).
+                                ls = get_lot_size(symbol, l.get('exchange', 'NSE')) or l.get('lot_size', 0)
+                                calculated = calculate_pnl(l['sell_price'], l['cmp'], ls, 1)
+                                calculated['lot_size'] = ls
+                                l.update(calculated)
+                                # Restore original_sell_price in case calculate/update clobbered it
+                                if 'original_sell_price' not in l or not l['original_sell_price']:
+                                    l['original_sell_price'] = l['sell_price']
 
-                # For active NSE specialist equities, always update and record the live P&L in metadata
-                elif is_equity and sig.status == SignalHistory.Status.ACTIVE:
-                    final_pnl = sum([float(l.get('pnl', 0)) for l in updated_legs])
-                    total_entry_val = sum([
-                        float(l.get('sell_price', 0)) * int(l.get('lot_size', 1))
-                        for l in updated_legs if l.get('status') != 'EXPIRED'
-                    ])
-                    final_pnl_pct = (final_pnl / total_entry_val * 100) if total_entry_val > 0 else 0
+                                # Reset cached baseline so it picks up the new price on activation
+                                cache_suffix = f"_{sig_id}" if sig_id else ""
+                                float_cache_key = f"specialist_baseline_{symbol}_{l['strike']}_{l['option_type']}{cache_suffix}"
+                                cache.set(float_cache_key, curr_cmp, 60 * 60 * 24)
                     
-                    sig.metadata['final_pnl'] = round(final_pnl, 2)
-                    sig.metadata['final_pnl_pct'] = round(final_pnl_pct, 2)
+                        section['status'] = 'PENDING'
+                        # Recalculate section_pnl from updated leg pnls to prevent ghost P&L leaking
+                        section['section_pnl'] = sum(float(l.get('pnl', 0)) for l in updated_legs)
+                    
+                        grace_min = int(grace_remaining // 60)
+                        grace_sec = int(grace_remaining % 60)
+                        logger.debug("[STRATEGY] Signal %s in grace period (%dm %ds remaining)", sig_id, grace_min, grace_sec)
+                    else:
+                        # Grace expired: lock current CMP as the real entry price and activate.
+                        # NOTE: original_sell_price is intentionally preserved — it must stay as
+                        # the price originally shown in the signal notification (pre-grace).
+                        for l in updated_legs:
+                            curr_cmp = float(l.get('cmp', 0))
+                            if curr_cmp > 0:
+                                # Snapshot original_sell_price before overwriting sell_price
+                                if not l.get('original_sell_price'):
+                                    l['original_sell_price'] = float(l.get('sell_price', curr_cmp))
+                                l['sell_price'] = curr_cmp
+                                # Re-calculate target, stop loss, and PNL with new sell_price
+                                l['target_price'] = round_to_tick(curr_cmp * 0.70, 0.05)
+                                l['stop_loss_price'] = round_to_tick(curr_cmp * 1.15, 0.05)
+                                # Fall back to this leg's own known-good lot_size on a failed
+                                # fresh lookup instead of overwriting it (audit fix H18).
+                                ls = get_lot_size(symbol, l.get('exchange', 'NSE')) or l.get('lot_size', 0)
+                                calculated = calculate_pnl(l['sell_price'], l['cmp'], ls, 1)
+                                calculated['lot_size'] = ls
+                                l.update(calculated)
+                                # Restore original_sell_price after dict update
+                                if not l.get('original_sell_price'):
+                                    l['original_sell_price'] = l['sell_price']
 
-                # If moving to ACTIVE for the first time, record the timestamp
-                if new_status == SignalHistory.Status.ACTIVE and not sig.active_time:
-                    sig.active_time = timezone.now()
-                    section['entry_time'] = sig.active_time.astimezone(IST).strftime("%H:%M")
+                                cache_suffix = f"_{sig_id}" if sig_id else ""
+                                lock_cache_key = f"specialist_baseline_{symbol}_{l['strike']}_{l['option_type']}{cache_suffix}"
+                                cache.set(lock_cache_key, curr_cmp, 60 * 60 * 24)
+                    
+                        new_status = SignalHistory.Status.ACTIVE
+                        just_activated = True
+                        section['status'] = 'ACTIVE'
+                        # Recalculate section_pnl from updated leg pnls to prevent ghost P&L leaking
+                        section['section_pnl'] = sum(float(l.get('pnl', 0)) for l in updated_legs)
+                    
+                        logger.info("[STRATEGY] Signal %s moved PENDING -> ACTIVE (Grace expired, entry locked at live CMP)", sig_id)
+                        # Telegram: Alert for signal activation (now disabled per user request, but keeping the try block structure)
+                        try:
+                            from stocks.services.telegram_service import maybe_send_telegram_activation
+                            maybe_send_telegram_activation(sig)
+                        except Exception as tg_err:
+                            logger.warning("[TELEGRAM] Failed to send activation alert: %s", tg_err)
+            
+                # B. Exits: Check for TGT/SL Hits (ONLY for ACTIVE orders)
+                any_sl = False
+                all_tgt = False
+                is_equity = True  # MCX removed platform-wide — every specialist signal is now NSE equity
+            
+                if sig.status == SignalHistory.Status.ACTIVE or new_status == SignalHistory.Status.ACTIVE:
+                    # Per-leg status logic refinement (Check against TGT/SL)
+                    for l in updated_legs:
+                        entry = float(l.get('sell_price', 0))
+                        cmp_now = float(l.get('cmp', 0))
+                        tgt = float(l.get('target_price', 0))
+                        sl = float(l.get('stop_loss_price', 0))
+                    
+                        # Prevent re-evaluating already completed legs. EXPIRED (rolled-away by
+                        # rebalance_delta_neutral_strangle) must stay terminal too — otherwise the
+                        # unconditional `is_equity` branch below resets it back to WAITING every
+                        # cycle, which both re-enables quote drift on a dead leg and makes
+                        # rebalance's `len(active_legs) != 2` check see 3 WAITING legs and bail out.
+                        if l.get('status') in ['HIT_TARGET', 'HIT_SL', 'EXPIRED']:
+                            continue
+
+                        # SCALE MISMATCH GUARD: entry and cmp are both sourced from the same
+                        # normalized quote pipeline (truedata_streamer divides WS ticks by 100
+                        # paise->Rupees; truedata_service's REST /quote path is already Rupees,
+                        # for every exchange including NFO) — see investigation notes in
+                        # AUDIT_REMEDIATION_PLAN.md item 7. Root cause traced to the now-deleted
+                        # MCX quote path (removed platform-wide 2026-07-24); no remaining code path
+                        # was found that double-scales a live NFO option premium. Given that, a
+                        # >2.5x jump here is far more likely to be a genuine large adverse move
+                        # (real loss for the seller) than a leftover unit bug — auto-dividing it by
+                        # 100 would silently turn a real loss into a false "win". Previously this
+                        # block did exactly that (divided cmp_now by a factor of 100); it now fails
+                        # safe instead: flag the leg theoretical/suspect and skip its exit check. Both
+                        # the per-leg elif below and the combined-premium systematic check further
+                        # down respect is_theoretical.
+                        if entry < 200 and cmp_now > 500:
+                            logger.error(
+                                "[SCALE_MISMATCH] %s %s %s entry=%.2f cmp=%.2f — flagging theoretical, no auto-exit.",
+                                sig.symbol, l.get('strike'), l.get('option_type'), entry, cmp_now
+                            )
+                            l['is_theoretical'] = True
+                            alert_key = f"scale_mismatch_alert_{sig_id}_{l.get('strike')}_{l.get('option_type')}"
+                            if not cache.get(alert_key):
+                                cache.set(alert_key, True, 60 * 15)  # throttle: once per 15 min per leg
+                                try:
+                                    from stocks.services.telegram_service import send_telegram_message
+                                    send_telegram_message(
+                                        f"⚠️ <b>SCALE MISMATCH — {sig.symbol}</b>\n"
+                                        f"Leg {l.get('option_type')} {l.get('strike')}: entry=₹{entry:.2f} cmp=₹{cmp_now:.2f}\n"
+                                        f"Auto-exit suppressed pending manual review."
+                                    )
+                                except Exception as tg_err:
+                                    logger.warning("[SCALE_MISMATCH] Telegram alert failed: %s", tg_err)
+                            continue
+                    
+                        # Equities bypass single-leg exits, but still check systematic strangle
+                        # overlays below (per-leg TGT/SL branch removed post-MCX removal — every
+                        # specialist signal is NSE equity now, so this was the only reachable path).
+                        l['status'] = 'WAITING'
                 
-                sig.status = new_status
-                sig.save()
+                    # --- INSTITUTIONAL SYSTEMATIC RISK ENGINE OVERLAYS ---
+                    # Exclude EXPIRED (rolled-away) legs: a symbol that has been through a delta
+                    # rebalance has 3+ SELL-action legs in metadata (old rolled leg + live one),
+                    # and this overlay is only meaningful across the two currently-live legs.
+                    sell_legs = [l for l in updated_legs if l.get('action') == 'SELL' and l.get('status') != 'EXPIRED']
+                    if len(sell_legs) == 2:
+                        ce_leg = next((l for l in sell_legs if l.get('option_type') == 'CE'), None)
+                        pe_leg = next((l for l in sell_legs if l.get('option_type') == 'PE'), None)
+
+                        # GHOST/SCALE PROTECTION: this combined-premium block is the *actual* live
+                        # exit path for every current specialist signal (all NSE equity — see
+                        # `is_equity = True` above), since that hardcode makes the single-leg
+                        # `elif ... not l.get('is_theoretical')` guard just above unreachable. Skip
+                        # the systematic SL/target/profit-capture math entirely if either leg is
+                        # flagged theoretical (self-healing WAF fallback, or SCALE_MISMATCH above)
+                        # — otherwise a suspect price still reaches HIT_TARGET/HIT_SL undetected.
+                        if (ce_leg and pe_leg and ce_leg.get('cmp', 0) > 0 and pe_leg.get('cmp', 0) > 0
+                                and not ce_leg.get('is_theoretical', False) and not pe_leg.get('is_theoretical', False)):
+                            ce_entry = float(ce_leg.get('original_sell_price', 0) or ce_leg.get('sell_price', 0))
+                            pe_entry = float(pe_leg.get('original_sell_price', 0) or pe_leg.get('sell_price', 0))
+                        
+                            entry_combined = ce_entry + pe_entry
+                            current_combined = float(ce_leg.get('cmp', 0)) + float(pe_leg.get('cmp', 0))
+                        
+                            # Theta Capture Percentage
+                            theta_capture_pct = 0.0
+                            if entry_combined > 0:
+                                theta_capture_pct = ((entry_combined - current_combined) / entry_combined) * 100.0
+                        
+                            # Premium Expansion Percentage
+                            premium_expansion_pct = 0.0
+                            if entry_combined > 0:
+                                premium_expansion_pct = ((current_combined - entry_combined) / entry_combined) * 100.0
+                            
+                            ce_delta = abs(float(ce_leg.get('delta', 0.0) or 0.0))
+                            pe_delta = abs(float(pe_leg.get('delta', 0.0) or 0.0))
+                            max_short_delta = max(ce_delta, pe_delta)
+
+                            # Audit fix (C4): physical-settlement/assignment-risk warning,
+                            # distinct from and earlier than the delta-danger auto-exit
+                            # below — informational only, does not itself close the
+                            # position. Index legs (cash-settled) never carry this risk.
+                            assignment_risk = is_physical_settlement_risk(sig.symbol, max_short_delta)
+                            section['assignment_risk'] = assignment_risk
+                            sig.metadata['assignment_risk'] = assignment_risk
+                            if assignment_risk:
+                                logger.warning(
+                                    "[ASSIGNMENT_RISK] %s is a physically-settled stock option nearing ITM "
+                                    "(delta=%.2f) — a short leg that drifts/gaps ITM before expiry can be "
+                                    "assigned, obligating physical delivery rather than cash settlement.",
+                                    sig.symbol, max_short_delta,
+                                )
+
+                            # Classify dynamic risk state
+                            risk_state = classify_risk_state(premium_expansion_pct, max_short_delta)
+                            section['risk_state'] = risk_state.value
+                            sig.metadata['risk_state'] = risk_state.value
+                            sig.metadata['theta_capture_pct'] = round(theta_capture_pct, 2)
+
+                            # Detect whether this is an intraday-flagged signal
+                            _is_intraday = any(l.get('is_intraday') for l in sell_legs)
+
+                            # Choose exit thresholds: intraday (fast) vs monthly (conservative)
+                            if _is_intraday:
+                                _sl_mult = INTRADAY_COMBINED_SL_MULT           # 1.25 (+25%)
+                                # Use early fast-capture if near expiry (DTE ≤ 3)
+                                try:
+                                    _exp_str = ce_leg.get('expiry', '')
+                                    _today_dt = timezone.now().astimezone(IST).date()
+                                    _exp_dt = datetime.strptime(_exp_str, "%d%b%Y").date()
+                                    _dte_now = (_exp_dt - _today_dt).days
+                                except Exception:
+                                    _dte_now = 99
+                                _capture_pct = INTRADAY_PROFIT_CAPTURE_EARLY if _dte_now <= 3 else INTRADAY_PROFIT_CAPTURE_PCT
+                            else:
+                                _sl_mult = COMBINED_SL_MULTIPLIER               # 1.30 (+30%)
+                                _capture_pct = PROFIT_CAPTURE_PCT               # 0.80 (80% decay)
+
+                            # A. Combined Premium Stop Loss Check
+                            if current_combined >= entry_combined * _sl_mult:
+                                logger.warning(
+                                    "[SYSTEMATIC_SL] %s SL: \u20b9%.2f >= \u20b9%.2f (%.0f%% expansion) | mode=%s",
+                                    sig.symbol, current_combined, entry_combined * _sl_mult,
+                                    premium_expansion_pct, "INTRADAY" if _is_intraday else "MONTHLY"
+                                )
+                                new_status = SignalHistory.Status.HIT_SL
+                                section['status'] = 'SL HIT'
+                                section['exit_reason'] = f"Combined Premium SL ({'+' if _is_intraday else '+'}{ int((_sl_mult-1)*100)}%)"
+
+                            # B. Profit Capture / Theta Decay Booking Check
+                            elif current_combined <= entry_combined * (1.0 - _capture_pct):
+                                logger.info(
+                                    "[SYSTEMATIC_TP] %s Target: \u20b9%.2f <= \u20b9%.2f (%.0f%% decay) | mode=%s | capture=%.0f%%",
+                                    sig.symbol, current_combined, entry_combined * (1.0 - _capture_pct),
+                                    theta_capture_pct, "INTRADAY" if _is_intraday else "MONTHLY",
+                                    _capture_pct * 100
+                                )
+                                new_status = SignalHistory.Status.HIT_TARGET
+                                section['status'] = 'TARGET HIT'
+                                section['exit_reason'] = "Systematic Profit Capture"
+                            
+                            # C. Delta Danger auto-exit Check
+                            elif max_short_delta >= SHORT_DELTA_DANGER and AUTO_EXIT_ON_DELTA_BREACH:
+                                logger.warning("[DELTA_BREACH_EXIT] Auto-exiting %s: Delta %.2f exceeds danger threshold %.2f", sig.symbol, max_short_delta, SHORT_DELTA_DANGER)
+                                new_status = SignalHistory.Status.HIT_SL
+                                section['status'] = 'SL HIT'
+                                section['exit_reason'] = f"Delta Breach (Delta={max_short_delta:.2f})"
+                            
+                            # D. Expiry Force-Exit DTE Guard
+                            today_dt = timezone.now().astimezone(IST).date()
+                            exp_date_str = ce_leg.get('expiry')
+                            if exp_date_str:
+                                try:
+                                    exp_dt = datetime.strptime(exp_date_str, "%d%b%Y").date()
+                                    dte = (exp_dt - today_dt).days
+                                    if dte <= FORCE_EXIT_DTE:
+                                        logger.warning("[EXPIRY_CLOSEOUT] Force-closing %s strangle: DTE is %d <= %d day threshold", sig.symbol, dte, FORCE_EXIT_DTE)
+                                        new_status = SignalHistory.Status.EXPIRED
+                                        section['status'] = 'EXPIRED'
+                                        section['exit_reason'] = f"Expiry Force-Exit (DTE={dte})"
+                                except Exception as dte_err:
+                                    logger.error(f"[DTE_ERROR] Failed to parse expiry date: {dte_err}")
+
+                    # Check for overall signal completion (equities only — MCX's "Option B" all-legs
+                    # branch removed platform-wide; every specialist signal is NSE equity now).
+                    if new_status in [SignalHistory.Status.HIT_SL, SignalHistory.Status.HIT_TARGET, SignalHistory.Status.EXPIRED]:
+                        # Direct closure logic for equities
+                        final_pnl = sum([float(lf.get('pnl', 0)) for lf in updated_legs])
+                        # Audit fix M9: only the currently-live legs' entry value belongs in the
+                        # % denominator — a rolled-away (EXPIRED) leg's original sell_price
+                        # inflates it, understating the true % return on a rolled position (the
+                        # rupee final_pnl above is already correct, since a frozen leg's pnl was
+                        # locked at its actual realized value when it was rolled).
+                        total_entry_val = sum([
+                            float(lf.get('sell_price', 0)) * int(lf.get('lot_size', 1))
+                            for lf in updated_legs if lf.get('status') != 'EXPIRED'
+                        ])
+                        final_pnl_pct = (final_pnl / total_entry_val * 100) if total_entry_val > 0 else 0
+
+                        sig.metadata['final_pnl'] = round(final_pnl, 2)
+                        sig.metadata['final_pnl_pct'] = round(final_pnl_pct, 2)
+
+                        try:
+                            from stocks.services.telegram_service import maybe_send_telegram_exit
+                            maybe_send_telegram_exit(sig, new_status)
+                        except Exception as tg_err:
+                            logger.warning("[TELEGRAM] Failed to send exit alert: %s", tg_err)
+                else:
+                    # Still PENDING: Keep legs in WAITING status until touched
+                    for l in updated_legs:
+                        l['status'] = 'WAITING'
+            
+                # Sync section status with final confirmed status
+                if new_status == SignalHistory.Status.ACTIVE:
+                    section['status'] = 'ACTIVE'
+            
+                # Commit Updates
+                if persist_updates:
+                    # --- RUN DELTA NEUTRAL REBALANCING (ROLLING) ---
+                    if sig.status == SignalHistory.Status.ACTIVE:
+                        rebalance_delta_neutral_strangle(sig, updated_legs, underlying_spot, sig_exchange, orch)
+                    
+                    current_metadata['legs'] = updated_legs
+                    sig.metadata = current_metadata
                 
-        except SignalHistory.DoesNotExist:
-            logger.warning("[STRATEGY] Attempted to persist to non-existent signal %s", sig_id)
+                    # --- AGGREGATE NET P&L RECORDING ---
+                    # Only lock in the P&L if we are transitioning from ACTIVE to a closed state.
+                    # was_active also covers a same-tick PENDING -> ACTIVE -> closed transition
+                    # (just_activated) — without it, a fast move that breaches target/SL right as
+                    # grace expires would skip this block (sig.status here still reads the PENDING
+                    # value from before this call) and permanently lock final_pnl at 0.0.
+                    is_closing = new_status in [SignalHistory.Status.HIT_SL, SignalHistory.Status.HIT_TARGET, SignalHistory.Status.EXPIRED, SignalHistory.Status.CANCELLED]
+                    was_active = (sig.status == SignalHistory.Status.ACTIVE) or just_activated
+                
+                    if is_closing and was_active:
+                        final_pnl = sum([float(l.get('pnl', 0)) for l in updated_legs])
+                        # Audit fix M9: exclude rolled-away (EXPIRED) legs from the % denominator
+                        # — see the matching comment on the equities-only branch above.
+                        total_entry_val = sum([
+                            float(l.get('sell_price', 0)) * int(l.get('lot_size', 1))
+                            for l in updated_legs if l.get('status') != 'EXPIRED'
+                        ])
+                        final_pnl_pct = (final_pnl / total_entry_val * 100) if total_entry_val > 0 else 0
+
+                        sig.metadata['final_pnl'] = round(final_pnl, 2)
+                        sig.metadata['final_pnl_pct'] = round(final_pnl_pct, 2)
+                        logger.info("[STRATEGY] Locked Net P&L for %s: Rs.%.2f (%.2f%%)", sig.symbol, final_pnl, final_pnl_pct)
+
+                    # For active NSE specialist equities, always update and record the live P&L in metadata
+                    elif is_equity and sig.status == SignalHistory.Status.ACTIVE:
+                        final_pnl = sum([float(l.get('pnl', 0)) for l in updated_legs])
+                        total_entry_val = sum([
+                            float(l.get('sell_price', 0)) * int(l.get('lot_size', 1))
+                            for l in updated_legs if l.get('status') != 'EXPIRED'
+                        ])
+                        final_pnl_pct = (final_pnl / total_entry_val * 100) if total_entry_val > 0 else 0
+                    
+                        sig.metadata['final_pnl'] = round(final_pnl, 2)
+                        sig.metadata['final_pnl_pct'] = round(final_pnl_pct, 2)
+
+                    # If moving to ACTIVE for the first time, record the timestamp
+                    if new_status == SignalHistory.Status.ACTIVE and not sig.active_time:
+                        sig.active_time = timezone.now()
+                        section['entry_time'] = sig.active_time.astimezone(IST).strftime("%H:%M")
+                
+                    sig.status = new_status
+                    sig.save()
+                
+            except SignalHistory.DoesNotExist:
+                logger.warning("[STRATEGY] Attempted to persist to non-existent signal %s", sig_id)
 
     # 5. P&L Suppression for Non-Entered Trades
     # Zero out P&L if the trade was never actually entered:

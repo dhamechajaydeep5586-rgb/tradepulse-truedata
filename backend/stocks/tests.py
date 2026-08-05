@@ -1,11 +1,12 @@
 import os
 from datetime import datetime, date, time
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from django.test import TestCase
 
-from stocks.models import SignalHistory
+from stocks.models import SignalHistory, ShortTermSignal
 from stocks.services.live_signal_service import update_signal_outcomes
 
 
@@ -1221,6 +1222,86 @@ class StrangleRollCapTests(TestCase):
         self.assertEqual(new_leg['last_roll_date'], today.isoformat())
 
 
+class ProcessLegsSignalLockTests(TestCase):
+    """
+    Audit fix (race condition found in a follow-up audit): process_legs() does a
+    read-modify-write against a SignalHistory row (fetch sig, mutate its
+    status/metadata/legs, then sig.save()) with no locking. Force Scan (bypasses
+    the panel's 2s/5s caches, runs process_legs inline on the request thread) can
+    overlap with the background scanner's periodic monitor pass for the SAME
+    signal — whichever thread's sig.save() lands last used to silently discard the
+    other thread's changes. Fixed with a per-signal-id threading.Lock, same
+    double-checked-lock-per-key idiom already used for TrueData auth
+    (_AUTH_LOCK / _ensure_fresh_token).
+    """
+
+    def test_same_signal_id_always_returns_the_same_lock_object(self):
+        from stocks.services.delta_hedge_service import _get_signal_lock
+
+        self.assertIs(_get_signal_lock(42), _get_signal_lock(42))
+
+    def test_different_signal_ids_get_independent_locks(self):
+        from stocks.services.delta_hedge_service import _get_signal_lock
+
+        self.assertIsNot(_get_signal_lock(1), _get_signal_lock(2))
+
+    def test_lock_serializes_concurrent_acquirers_for_same_id(self):
+        """Direct concurrency reproduction (mirrors
+        EnsureFreshTokenConcurrencyTests): N threads racing to acquire the same
+        signal's lock must never be inside the critical section simultaneously."""
+        import threading
+        import time as time_module
+        from stocks.services.delta_hedge_service import _get_signal_lock
+
+        sig_id = 999
+        state_lock = threading.Lock()
+        concurrent = 0
+        max_concurrent = 0
+        barrier = threading.Barrier(5)
+
+        def worker():
+            nonlocal concurrent, max_concurrent
+            barrier.wait()
+            with _get_signal_lock(sig_id):
+                with state_lock:
+                    concurrent += 1
+                    max_concurrent = max(max_concurrent, concurrent)
+                time_module.sleep(0.01)
+                with state_lock:
+                    concurrent -= 1
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(max_concurrent, 1)
+
+    def test_process_legs_acquires_the_signal_lock_when_persisting(self):
+        """Integration check: process_legs must actually take this lock (keyed on
+        the real signal id) whenever it persists, not just have the helper exist
+        unused."""
+        import threading
+        from stocks.services.delta_hedge_service import process_legs
+
+        sig = SignalHistory.objects.create(
+            symbol="LOCKTEST", signal_type="STRANGLE", entry_price=100.0,
+            target=0, stop_loss=0, status=SignalHistory.Status.ACTIVE,
+            category="specialist", metadata={"legs": []},
+        )
+        section = {'underlying': 'LOCKTEST', 'legs': [], 'section_pnl': 0, 'status': 'ACTIVE'}
+        panel_data = {'total_pnl': 0, 'sections': []}
+
+        with patch("stocks.services.delta_hedge_service._get_signal_lock") as mock_get_lock:
+            mock_get_lock.return_value = threading.Lock()
+            process_legs(
+                section, [], orch=MagicMock(), panel_data=panel_data,
+                persist_updates=True, sig_id=sig.id, underlying_spot=500.0,
+            )
+            mock_get_lock.assert_called_once_with(sig.id)
+
+
 class SingleWorkerGuardTests(TestCase):
     """
     Audit fix H1: the single-worker-process assumption (REST rate-limit lock,
@@ -1276,12 +1357,27 @@ class SingleWorkerGuardTests(TestCase):
             with self.assertRaises(RuntimeError):
                 _assert_single_gunicorn_worker()
 
-    def test_web_concurrency_env_var_overrides_and_raises(self):
-        """WEB_CONCURRENCY is gunicorn's own override, and takes priority — a
-        `--workers 1` flag with WEB_CONCURRENCY=3 set must still be caught."""
+    def test_explicit_cli_workers_flag_wins_over_web_concurrency(self):
+        """Bug fix (follow-up audit, verified against the real gunicorn package):
+        an explicit --workers CLI flag always wins over WEB_CONCURRENCY in real
+        gunicorn — WEB_CONCURRENCY is only its fallback DEFAULT for when no CLI
+        flag is given. The previous version of this test encoded the opposite
+        (wrong) precedence, which is exactly the bug: WEB_CONCURRENCY=3 set for
+        any unrelated reason would false-positive-crash a perfectly safe
+        `--workers 1` boot on every single deploy."""
         from stocks.apps import _assert_single_gunicorn_worker
 
         argv = ["gunicorn", "config.wsgi:application", "--workers", "1"]
+        with patch("sys.argv", argv), patch.dict("os.environ", {"WEB_CONCURRENCY": "3"}):
+            _assert_single_gunicorn_worker()  # must NOT raise — the explicit "1" wins
+
+    def test_web_concurrency_used_only_when_no_explicit_cli_flag(self):
+        """WEB_CONCURRENCY is still a real, valid way to misconfigure worker count
+        on a platform that doesn't pass --workers explicitly — must still be
+        caught in that case."""
+        from stocks.apps import _assert_single_gunicorn_worker
+
+        argv = ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000"]
         with patch("sys.argv", argv), patch.dict("os.environ", {"WEB_CONCURRENCY": "3"}):
             with self.assertRaises(RuntimeError):
                 _assert_single_gunicorn_worker()
@@ -1395,6 +1491,106 @@ class ResetStrategyAtomicityTests(TestCase):
         response = client.post("/api/stocks/delta-hedge/")
 
         self.assertEqual(response.status_code, 403)
+
+
+class ResetStrategyConcentrationCapTests(TestCase):
+    """
+    Audit fix (H3 follow-up): Reset Strategy (DeltaHedgeView.post()) rebuilt the
+    entire specialist book by ranking candidates on confidence alone — the same
+    sector/correlation/promoter-group concentration caps _background_scan() already
+    applies (see SpecialistPortfolioConstraintTests) were never wired into this path,
+    so a reset could rebuild the book as several correlated names that all breach on
+    the same macro trigger. Also folds in the M7-recurrence fix: the candidate slice
+    was hardcoded to `[:10]` instead of reading HEDGE_MAX_SIGNALS from settings.
+    """
+
+    def setUp(self):
+        from django.contrib.auth import get_user_model
+        from django.core.cache import cache
+        # force_scan is a shared, tightly-limited throttle scope (2/min) that
+        # DeltaHedgeView.post() always uses regardless of query params (see
+        # get_throttles()) — clear it so unrelated tests elsewhere in the suite
+        # that also POST to this endpoint can't burn this class's quota.
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="reset_cap_test_user", password="x", is_temporary=False,
+        )
+
+    def test_constraint_filter_runs_before_legs_are_built(self):
+        """Integration check: candidates rejected by the concentration filter must
+        never reach build_specialist_hedge (mirrors
+        test_background_scan_calls_constraint_filter_before_creating_signals)."""
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=self.user)
+
+        with patch("stocks.services.delta_hedge_service.NIFTY_50_STOCKS", return_value=["SYMA", "SYMB"]), \
+             patch("stocks.services.delta_hedge_service.ENTRY_WINDOW_START", time(0, 0)), \
+             patch("stocks.services.delta_hedge_service.ENTRY_WINDOW_END", time(23, 59)), \
+             patch("stocks.services.market_intelligence_service.get_symbol_market_state", return_value={
+                 "is_within_va": True, "vah": 0, "val": 0, "confidence": 60,
+                 "current_price": 500.0,
+             }), \
+             patch("stocks.services.market_data_orchestrator.get_orchestrator") as mock_get_orch, \
+             patch("stocks.services.truedata_service.get_truedata_instance") as mock_get_svc, \
+             patch("stocks.services.shared.portfolio_risk.apply_portfolio_constraints") as mock_apc, \
+             patch("stocks.services.delta_hedge_service.build_specialist_hedge") as mock_build:
+            mock_orch = MagicMock()
+            mock_orch.get_price.return_value = {"ltp": 500.0}
+            mock_get_orch.return_value = mock_orch
+            mock_get_svc.return_value = MagicMock()
+            # Both candidates rejected -> build_specialist_hedge must never run,
+            # and with nothing built the endpoint must fail closed (503), leaving
+            # any existing book untouched (H5 behavior).
+            mock_apc.return_value = ([], [{"symbol": "SYMA"}, {"symbol": "SYMB"}])
+
+            response = client.post("/api/stocks/delta-hedge/")
+
+            mock_apc.assert_called_once()
+            mock_build.assert_not_called()
+        self.assertEqual(response.status_code, 503)
+
+    def test_selection_uses_settings_driven_cap_not_hardcoded_ten(self):
+        """M7 recurrence: HEDGE_MAX_SIGNALS must actually govern the candidate
+        slice, not a hardcoded [:10]."""
+        from django.test import override_settings
+        from rest_framework.test import APIClient
+
+        client = APIClient()
+        client.force_authenticate(user=self.user)
+
+        symbols = [f"SYM{i}" for i in range(5)]
+
+        def fake_constraints(candidates, open_positions, sector_map, clusters, max_positions, profile=None):
+            # Echo back exactly what the real function would enforce: capped at
+            # max_positions (== target_count, which must reflect the override).
+            return candidates[:max_positions], candidates[max_positions:]
+
+        with override_settings(HEDGE_MAX_SIGNALS=2), \
+             patch("stocks.services.delta_hedge_service.NIFTY_50_STOCKS", return_value=symbols), \
+             patch("stocks.services.delta_hedge_service.ENTRY_WINDOW_START", time(0, 0)), \
+             patch("stocks.services.delta_hedge_service.ENTRY_WINDOW_END", time(23, 59)), \
+             patch("stocks.services.market_intelligence_service.get_symbol_market_state", return_value={
+                 "is_within_va": True, "vah": 0, "val": 0, "confidence": 60,
+                 "current_price": 500.0,
+             }), \
+             patch("stocks.services.market_data_orchestrator.get_orchestrator") as mock_get_orch, \
+             patch("stocks.services.truedata_service.get_truedata_instance") as mock_get_svc, \
+             patch("stocks.services.shared.portfolio_risk.apply_portfolio_constraints", side_effect=fake_constraints), \
+             patch("stocks.services.delta_hedge_service.build_specialist_hedge", return_value=[{"leg": 1}]):
+            mock_orch = MagicMock()
+            mock_orch.get_price.return_value = {"ltp": 500.0}
+            mock_get_orch.return_value = mock_orch
+            mock_get_svc.return_value = MagicMock()
+
+            response = client.post("/api/stocks/delta-hedge/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data.get("created"), 2,
+            "HEDGE_MAX_SIGNALS=2 must actually cap creation at 2, not a hardcoded 10",
+        )
 
 
 class OptionBuyingSameDayExpiryTests(TestCase):
@@ -1557,6 +1753,101 @@ class AssignmentRiskFlagTests(TestCase):
 
         self.assertTrue(len(res) >= 2)
         self.assertTrue(all(leg.get('instrument_type') == 'OPTSTK' for leg in res))
+
+
+class TradeEngineRiskControlsTests(TestCase):
+    """
+    Bug fix (found in a follow-up audit): trade_engine.py — the short-term engine
+    actually scheduled live in production (not swing_service.py V2, which only
+    runs as a shadow scan) — had no position sizing (qty/rupee_risk always NULL),
+    no cap on new positions per scan, no sector/correlation/promoter-group
+    concentration control, and no daily-loss/drawdown circuit breaker.
+    """
+
+    def setUp(self):
+        from django.core.cache import cache
+        from stocks.services.trade_engine import TRADE_ENGINE_DRAWDOWN_HALT_KEY
+        self.cache = cache
+        self.halt_key = TRADE_ENGINE_DRAWDOWN_HALT_KEY
+        self.cache.delete(self.halt_key)
+
+    def tearDown(self):
+        self.cache.delete(self.halt_key)
+
+    def _held_signal(self, symbol, entry, qty, pnl_pct):
+        return ShortTermSignal.objects.create(
+            symbol=symbol, entry_price=Decimal(str(entry)), stop_loss=Decimal(str(entry * 0.9)),
+            target=Decimal(str(entry * 1.2)), status=ShortTermSignal.Status.ACTIVE,
+            qty=qty, pnl_pct=Decimal(str(pnl_pct)),
+        )
+
+    def test_drawdown_halt_trips_past_strategy_limit(self):
+        from stocks.services.trade_engine import _check_trade_engine_drawdown_halt, PROFILE
+        from stocks.services.shared import allocated_equity
+
+        equity = allocated_equity(PROFILE)
+        limit_pct = PROFILE.strategy_drawdown_limit_pct
+        # One large position, deep enough in loss that open P&L alone clears the
+        # strategy drawdown limit (limit% + margin, as a % loss on this position).
+        entry = 1000.0
+        qty = 100
+        notional = entry * qty
+        required_pnl_pct = -(equity * (limit_pct / 100.0) * 1.5) / notional * 100.0
+        self._held_signal("BIGLOSS", entry, qty, required_pnl_pct)
+
+        self.assertTrue(_check_trade_engine_drawdown_halt())
+        self.assertTrue(self.cache.get(self.halt_key))
+
+    def test_drawdown_halt_does_not_trip_on_small_loss(self):
+        from stocks.services.trade_engine import _check_trade_engine_drawdown_halt
+
+        self._held_signal("SMALLLOSS", 1000.0, 10, -1.0)  # trivial loss
+        self.assertFalse(_check_trade_engine_drawdown_halt())
+        self.assertIsNone(self.cache.get(self.halt_key))
+
+    def test_pending_signals_do_not_count_toward_drawdown(self):
+        """PENDING signals haven't been entered yet and carry no real open P&L —
+        only HELD_LIFECYCLE_STATUSES should count."""
+        from stocks.services.trade_engine import _check_trade_engine_drawdown_halt
+
+        ShortTermSignal.objects.create(
+            symbol="PENDINGSYM", entry_price=Decimal("1000"), stop_loss=Decimal("900"),
+            target=Decimal("1200"), status=ShortTermSignal.Status.PENDING,
+            qty=1000, pnl_pct=Decimal("-50"),  # would trip the halt if it counted
+        )
+        self.assertFalse(_check_trade_engine_drawdown_halt())
+
+    def test_scanner_short_circuits_immediately_when_halted(self):
+        """The halt must be checked BEFORE any market-direction/TrueData/universe
+        work — verified by mocking get_market_direction to blow up if reached."""
+        from stocks.services.trade_engine import _run_daily_scanner_impl
+
+        self.cache.set(self.halt_key, True, timeout=3600)
+
+        with patch("stocks.services.pro_system_service.get_market_direction") as mock_direction, \
+             patch("stocks.services.trade_engine._send_telegram_scanner_summary") as mock_tg:
+            result = _run_daily_scanner_impl(send_telegram=True)
+            mock_direction.assert_not_called()
+            mock_tg.assert_called_once()
+
+        self.assertEqual(result, [])
+
+    def test_position_sizing_skips_candidate_that_cannot_be_sized(self):
+        """A pick whose stop distance is 0 (or otherwise unsizeable) must be
+        skipped rather than persisted with a NULL/zero qty."""
+        from stocks.services.shared.risk_engine import position_size
+        from stocks.services.trade_engine import PROFILE
+
+        qty, rupee_risk = position_size(entry=100.0, stop_loss=100.0, profile=PROFILE)
+        self.assertEqual(qty, 0)
+
+    def test_position_sizing_produces_real_qty_for_normal_candidate(self):
+        from stocks.services.shared.risk_engine import position_size
+        from stocks.services.trade_engine import PROFILE
+
+        qty, rupee_risk = position_size(entry=1000.0, stop_loss=950.0, profile=PROFILE)
+        self.assertGreater(qty, 0)
+        self.assertGreater(rupee_risk, 0)
 
 
 class IntradayRRRecomputeAfterSlippageTests(TestCase):
@@ -1741,6 +2032,70 @@ class BhavcopyZipExtractionTests(TestCase):
         })
         df = _extract_csv_from_zip(zf)
         self.assertEqual(df.iloc[0]["SYMBOL"], "RELIANCE")
+
+
+class EnsureFreshTokenConcurrencyTests(TestCase):
+    """
+    Bug fix (found in a follow-up audit): _ensure_fresh_token() used to call
+    self.authenticate() directly with no lock, even though authenticate() itself
+    does a real streamer stop-then-replace sequence. Called from 8 different REST
+    methods, two threads both deciding the token is near-expiry could race
+    through that sequence concurrently, orphaning whichever streamer lost the
+    race — the exact zombie-WebSocket bug C6 was written to prevent, reachable
+    via a second, unguarded path. Now serialized through the same module-level
+    _AUTH_LOCK initialize_truedata() already uses, with a double-check inside
+    the lock so a thread that lost the race doesn't redundantly re-auth.
+    """
+
+    def test_concurrent_calls_never_run_authenticate_simultaneously(self):
+        import threading
+        import time as time_module
+        from stocks.services import truedata_service as tds
+
+        svc = tds.TrueDataService(username="dummy", password="dummy")
+        svc.is_authenticated = True
+        svc.token_expires_at = time_module.time() - 1  # already past the 5-min guard band
+
+        state = {"concurrent": 0, "max_concurrent": 0}
+        state_lock = threading.Lock()
+
+        def fake_authenticate():
+            with state_lock:
+                state["concurrent"] += 1
+                state["max_concurrent"] = max(state["max_concurrent"], state["concurrent"])
+            time_module.sleep(0.05)  # simulate the real auth POST + streamer swap taking time
+            with state_lock:
+                state["concurrent"] -= 1
+            svc.token_expires_at = time_module.time() + 3600  # simulate a successful refresh
+
+        with patch.object(svc, "authenticate", side_effect=fake_authenticate) as mock_auth:
+            threads = [threading.Thread(target=svc._ensure_fresh_token) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        self.assertEqual(
+            state["max_concurrent"], 1,
+            "_AUTH_LOCK must fully serialize concurrent re-auth attempts — "
+            "authenticate() must never run on two threads at once",
+        )
+        self.assertGreaterEqual(mock_auth.call_count, 1)
+
+    def test_fresh_token_skips_authenticate_entirely(self):
+        """Sanity check: the fast-path (no lock needed) must still work when the
+        token genuinely isn't near expiry."""
+        import time as time_module
+        from stocks.services import truedata_service as tds
+
+        svc = tds.TrueDataService(username="dummy", password="dummy")
+        svc.is_authenticated = True
+        svc.token_expires_at = time_module.time() + 3600
+
+        with patch.object(svc, "authenticate") as mock_auth:
+            svc._ensure_fresh_token()
+
+        mock_auth.assert_not_called()
 
 
 class LivePriceByTokenFreshnessTests(TestCase):
