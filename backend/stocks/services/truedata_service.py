@@ -444,7 +444,20 @@ class TrueDataService:
         that shared function's format assumption. TrueData's getSymbolExpiryList
         (Market Data API doc doesn't cover it; confirmed via the TD Postman
         collection) returns yyyymmdd.
+
+        Cached 15 min: expiry lists are static within a trading day, but
+        get_lot_size/get_nse_option_strikes/get_nse_option_quote each call this
+        independently for the same symbol — uncached, one specialist scan
+        (~28 candidates) fanned this out into hundreds of redundant REST calls
+        and tripped the quote circuit breaker for the whole scan, not just one
+        stock. Same fix pattern as get_candle_data's cache below.
         """
+        from django.core.cache import cache as _dj_cache
+        cache_key = f"td_expiry_list_{symbol}"
+        cached = _dj_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         self._ensure_fresh_token()
         try:
             url = f"{HISTORY_BASE}/getSymbolExpiryList"
@@ -460,6 +473,8 @@ class TrueDataService:
                         break
                     except ValueError:
                         continue
+            if out:
+                _dj_cache.set(cache_key, out, timeout=900)
             return out
         except Exception as e:
             logger.error("[TRUEDATA] get_expiry_list failed for %s: %s", symbol, e)
@@ -479,7 +494,19 @@ class TrueDataService:
         VERIFIED against a live TrueData account (2026-08-05): the CSV response
         is headerless positional data, not the named-header format originally
         guessed — see the column comment inline below.
+
+        Cached 15 min: strikes/lot sizes are static intraday, but get_lot_size,
+        get_nse_option_strikes, and get_nse_option_quote (called separately per
+        CE/PE leg, per retry distance, per rebalance/audit pass) each refetch
+        the full chain for the same symbol/expiry — see get_expiry_list's cache
+        note for the production impact (circuit-breaker trips scan-wide).
         """
+        from django.core.cache import cache as _dj_cache
+        cache_key = f"td_option_chain_{symbol}_{expiry}"
+        cached = _dj_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         self._ensure_fresh_token()
         try:
             td_expiry = datetime.strptime(expiry, "%d%b%Y").strftime("%Y%m%d")
@@ -523,6 +550,8 @@ class TrueDataService:
                     "lotsize": lotsize or 0,
                     "instrumenttype": "OPTIDX" if symbol.upper() in index_underlyings else "OPTSTK",
                 })
+            if rows:
+                _dj_cache.set(cache_key, rows, timeout=900)
             return rows
         except Exception as e:
             logger.error("[TRUEDATA] get_option_chain failed for %s/%s: %s", symbol, expiry, e)
