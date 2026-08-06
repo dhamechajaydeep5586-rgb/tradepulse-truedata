@@ -48,7 +48,9 @@ const DeltaHedgePanel = () => {
         const mySeq = ++requestSeqRef.current;
         try {
             const url = force ? '/api/stocks/delta-hedge/?force=true' : '/api/stocks/delta-hedge/';
-            const response = await axios.get(url);
+            // A force scan triggers a real backend scan (30-90s+), well past the axios
+            // instance's default 20s timeout meant for hung plain polls — override it here.
+            const response = await axios.get(url, force ? { timeout: 120000 } : undefined);
             if (mySeq !== requestSeqRef.current) return; // a newer request already superseded this one
             setData(response.data);
             setError(null);

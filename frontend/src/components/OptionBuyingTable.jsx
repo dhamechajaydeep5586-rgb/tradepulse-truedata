@@ -101,7 +101,9 @@ export default function OptionBuyingTable() {
     if (force) setLoading(true);
     const mySeq = ++requestSeqRef.current;
     const url = force ? "/api/stocks/option-buying/?force=true" : "/api/stocks/option-buying/";
-    API.get(url)
+    // A force scan triggers a real backend scan (30-90s+), well past the axios
+    // instance's default 20s timeout meant for hung plain polls — override it here.
+    API.get(url, force ? { timeout: 120000 } : undefined)
       .then((res) => {
         if (mySeq !== requestSeqRef.current) return; // a newer request already superseded this one
         setData(res.data);

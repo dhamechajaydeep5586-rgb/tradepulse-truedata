@@ -122,7 +122,9 @@ export default function LiveSignalsTable() {
     setError(null);
 
     const url = force === true ? "/api/stocks/live-signals/?force=true" : "/api/stocks/live-signals/";
-    API.get(url)
+    // A force scan triggers a real backend scan (30-90s+), well past the axios
+    // instance's default 20s timeout meant for hung plain polls — override it here.
+    API.get(url, force === true ? { timeout: 120000 } : undefined)
       .then((r) => {
         setData(r.data);
         isOpenRef.current = r.data?.market_status === "OPEN";

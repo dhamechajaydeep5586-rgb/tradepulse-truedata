@@ -2314,7 +2314,17 @@ def rebalance_delta_neutral_strangle(sig, updated_legs, underlying_spot, sig_exc
     pe_leg = next((l for l in active_legs if l.get('option_type') == 'PE'), None)
     if not ce_leg or not pe_leg:
         return
-        
+
+    # A quote-fetch failure (e.g. TrueData rate-limit circuit breaker) leaves
+    # underlying_spot at its 0 default — feeding that into calculate_greeks()
+    # below raises "math domain error" (log(spot/strike) with spot=0) and
+    # silently produces a fake Delta: 0.00 / Imbalance: 0.00 result, which
+    # masks a real delta breach instead of skipping the check. Skip this cycle
+    # and retry on the next tick once a real quote is available.
+    if underlying_spot <= 0:
+        logger.warning(f"[REBALANCE_CHECK] {symbol}: skipping — invalid spot price ({underlying_spot})")
+        return
+
     # Calculate days to expiry (t_days)
     try:
         today_date = timezone.now().astimezone(IST).date()
