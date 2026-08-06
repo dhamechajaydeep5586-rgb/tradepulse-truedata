@@ -452,35 +452,26 @@ def get_live_signals(action: str | None = None) -> dict[str, Any]:
         return payload
 
     # ── Strict Action and Generation Router ──────────────────────────────────
-    # Bounded-retry generation cap (added 2026-07-29 at the account owner's request
-    # as a one-shot-per-day gate; audit fix M10 relaxed it to a bounded retry).
-    # Originally this checked whether a signal had been PERSISTED today, which meant
-    # a day where every attempt found zero qualifying candidates kept re-running the
-    # full ~100-symbol universe scan (150-200 REST calls) every 15 min all day — a
-    # plausible contributor to Angel One rate-limit exhaustion on a bad day. A hard
-    # one-attempt-per-day stop overcorrected: a bad opening range silently forfeited
-    # a good afternoon setup, contradicting the documented every-15-minutes cadence.
-    # Now retries generation up to INTRADAY_MAX_GENERATION_ATTEMPTS times per day,
-    # but ONLY while today's book is still empty — once anything from today exists
-    # (even a single signal), later cycles fall back to "update" regardless of
-    # attempt count, same as a successful day always behaved. An explicit
-    # action="generate" (Force Scan) still bypasses this entirely — it's a
-    # deliberate manual override, not the passive 15-min auto-resolve path.
+    # Retry every periodic tick (~15 min) until a signal actually lands, not just
+    # INTRADAY_MAX_GENERATION_ATTEMPTS (4) times then going silent for the rest of
+    # the day — same fix as option_buying_service.py / delta_hedge_service.py's
+    # equivalent gates. Was capped specifically to avoid repeated full ~100-symbol
+    # universe scans (150-200 REST calls each) contributing to TrueData rate-limit
+    # exhaustion on a bad day — removing the cap trades that protection for the
+    # account owner's explicit ask (2026-08-06) of continuous retries. If rate-limit
+    # exhaustion from repeated all-zero scans becomes a real problem, re-add a cap
+    # here rather than assuming it won't recur.
     today_key = now_ist.date().isoformat()
     generation_attempted_key = f"intraday_generation_attempts_{today_key}"
-    MAX_GENERATION_ATTEMPTS_PER_DAY = int(getattr(settings, "INTRADAY_MAX_GENERATION_ATTEMPTS", 4))
     attempts_so_far = cache.get(generation_attempted_key, 0)
     is_first_attempt_today = attempts_so_far == 0
     today_has_any_signal = SignalHistory.objects.filter(
         category="intraday", generated_at__date=now_ist.date(),
     ).exists()
-    generation_already_attempted = (
-        today_has_any_signal or attempts_so_far >= MAX_GENERATION_ATTEMPTS_PER_DAY
-    )
 
     resolved_action = action
     if resolved_action is None:
-        resolved_action = "update" if generation_already_attempted else "generate"
+        resolved_action = "update" if today_has_any_signal else "generate"
 
     # Before INTRADAY_GENERATION_START (9:45 AM), skip generation entirely — the opening
     # 9:15-9:45 range is dominated by gap-driven noise, and VAH/VAL/POC crosses in it are

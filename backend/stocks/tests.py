@@ -2370,3 +2370,25 @@ class OptionChainFallbackTests(TestCase):
         self.assertFalse(result.get("is_mock"))
         self.assertEqual(result.get("spot_price"), 24500)
 
+
+class ShortTermSignalCacheInvalidationTests(TestCase):
+    """Saving a ShortTermSignal must bust both the dashboard-summary and
+    pro-system caches (apps.py's post_save receiver) — otherwise the two
+    pages can disagree for up to their 20s/30s TTL after a real status
+    change (the bug this receiver was added to fix)."""
+
+    def test_save_clears_both_dashboard_caches(self):
+        from django.core.cache import cache
+
+        cache.set('dashboard_summary_20s', {'stale': True}, timeout=60)
+        cache.set('trade_engine_dashboard_30s', {'stale': True}, timeout=60)
+
+        ShortTermSignal.objects.create(
+            symbol='TESTSTK', entry_price=Decimal('100.00'),
+            stop_loss=Decimal('95.00'), target=Decimal('110.00'),
+            status=ShortTermSignal.Status.PENDING,
+        )
+
+        self.assertIsNone(cache.get('dashboard_summary_20s'))
+        self.assertIsNone(cache.get('trade_engine_dashboard_30s'))
+

@@ -68,6 +68,24 @@ class StocksConfig(AppConfig):
     name = 'stocks'
 
     def ready(self):
+        # Invalidate the dashboard-summary/pro-system caches on every ShortTermSignal
+        # write, instead of each independently expiring on its own 20s/30s TTL with no
+        # shared invalidation — that gap let the two pages show different data (e.g. one
+        # still "PENDING" after activation) for up to 30s after a real status change. One
+        # post_save receiver here catches every write site (activation, exit, review,
+        # etc.) instead of adding a cache.delete() at each one individually. Registered
+        # unconditionally (before the test-mode guard below) since connecting a signal
+        # receiver has no network/scheduler side effects, unlike the rest of this method.
+        from django.db.models.signals import post_save
+        from django.dispatch import receiver
+        from django.core.cache import cache
+        from stocks.models import ShortTermSignal
+
+        @receiver(post_save, sender=ShortTermSignal, weak=False)
+        def _invalidate_dashboard_caches(sender, **kwargs):
+            cache.delete('dashboard_summary_20s')
+            cache.delete('trade_engine_dashboard_30s')
+
         # 0. Test-mode guard: `manage.py test` (and CI running the same command)
         # must never start the APScheduler background jobs or log into the live
         # TrueData session as a side effect of importing the app config.
