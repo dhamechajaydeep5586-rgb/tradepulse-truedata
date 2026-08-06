@@ -1038,6 +1038,7 @@ def run_expiry_cleanup():
                 chat_id = get_short_term_chat_id()
                 msg = (
                     f"⏰ <b>TRADE SETUP EXPIRED</b>\n"
+                    f"📈 Short-Term\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"Stock: <b>{db_trade.symbol}</b>\n"
                     f"▸ Entry: ₹{db_trade.entry_price}\n"
@@ -1111,6 +1112,7 @@ def run_expiry_cleanup():
                 chat_id = get_short_term_chat_id()
                 msg = (
                     f"🔔 <b>REVIEW REQUIRED</b>\n"
+                    f"📈 Short-Term\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"Stock: <b>{db_trade.symbol}</b>\n"
                     f"▸ Entry: ₹{db_trade.entry_price}\n"
@@ -1260,6 +1262,7 @@ def _exit_signal(sig: ShortTermSignal, exit_price: float, status: str, exit_reas
 
         msg = (
             f"{emoji} <b>{title}</b>\n"
+            f"📈 Short-Term\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Stock: <b>{sig.symbol}</b>\n"
             f"▸ Entry Price: ₹{entry_f:.2f}\n"
@@ -1443,6 +1446,7 @@ def _send_telegram_scanner_summary(trades: list, direction: dict):
         if not trades:
             msg = (
                 f"📊 <b>DAILY SCANNER REPORT</b>\n"
+                f"📈 Short-Term\n"
                 f"🕒 {now_str}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Market: {trend_emoji} {trend}\n\n"
@@ -1466,6 +1470,7 @@ def _send_telegram_scanner_summary(trades: list, direction: dict):
 
         msg = (
             f"🚀 <b>DAILY SCANNER — NEW BUY TODAY SETUPS</b>\n"
+            f"📈 Short-Term\n"
             f"🕒 {now_str}\n"
             f"Market: {trend_emoji} {trend} | Nifty: {direction.get('close', 'N/A')}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1517,6 +1522,7 @@ def _send_telegram_eod_status():
 
         msg = (
             f"📊 <b>EOD PORTFOLIO STATUS</b>\n"
+            f"📈 Short-Term\n"
             f"🕒 {now_str}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{portfolio_emoji} Portfolio Avg: <b>{avg_pnl:+.2f}%</b> ({len(active)} holdings)\n"
@@ -1823,6 +1829,7 @@ def check_pending_activations():
                     chat_id = get_short_term_chat_id()
                     msg = (
                         f"✅ <b>BUY ACTIVATED</b>\n"
+                        f"📈 Short-Term\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"Stock: <b>{db_trade.symbol}</b>\n"
                         f"▸ Entry Trigger: <b>₹{trigger_price:.2f}</b>\n"
