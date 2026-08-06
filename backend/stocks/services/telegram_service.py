@@ -541,6 +541,12 @@ def send_periodic_pnl_updates() -> bool:
 
         ce_delta = float(ce_leg.get("delta", 0.0)) if ce_leg else 0.0
         pe_delta = float(pe_leg.get("delta", 0.0)) if pe_leg else 0.0
+        # A quote-fetch failure (e.g. TrueData rate-limit) makes process_legs() fall
+        # back to a Black-Scholes theoretical premium instead of the real market
+        # price — real, but was never surfaced here, so it broadcast identically to
+        # a live quote with no indication it's an estimate, not the actual broker price.
+        ce_theoretical = bool(ce_leg.get("is_theoretical")) if ce_leg else False
+        pe_theoretical = bool(pe_leg.get("is_theoretical")) if pe_leg else False
 
         lot_size = ce_leg.get("lot_size", 0) if ce_leg else (pe_leg.get("lot_size", 0) if pe_leg else 0)
 
@@ -602,6 +608,8 @@ def send_periodic_pnl_updates() -> bool:
             "pe_old_premium": pe_original,
             "pe_new_premium": pe_cmp,
             "pe_delta": pe_delta,
+            "ce_theoretical": ce_theoretical,
+            "pe_theoretical": pe_theoretical,
             "pnl": running_pnl,
             "pnl_pct": pnl_pct,
         })

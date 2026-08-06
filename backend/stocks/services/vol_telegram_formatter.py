@@ -208,9 +208,14 @@ def format_consolidated_live_updates(updates_data: List[Dict[str, Any]]) -> str:
         pnl_symbol = "🟢" if pnl >= 0 else "🔴"
 
         lot_size = up.get("lot_size", 0)
+        # "~" marks a Black-Scholes theoretical estimate (real quote fetch failed,
+        # e.g. TrueData rate-limited) instead of the actual live broker premium —
+        # without this a modeled price is indistinguishable from a real one.
+        ce_est = "~" if up.get("ce_theoretical") else ""
+        pe_est = "~" if up.get("pe_theoretical") else ""
         msg += f"{i+1}. *{symbol}* — Spot: ₹{spot:,.2f} (Lot: {lot_size:,})\n"
-        msg += f"   • CE {ce_strike:,.0f}: ₹{ce_old:.2f} → ₹{ce_new:.2f}\n"
-        msg += f"   • PE {pe_strike:,.0f}: ₹{pe_old:.2f} → ₹{pe_new:.2f}\n"
+        msg += f"   • CE {ce_strike:,.0f}: ₹{ce_old:.2f} → {ce_est}₹{ce_new:.2f}\n"
+        msg += f"   • PE {pe_strike:,.0f}: ₹{pe_old:.2f} → {pe_est}₹{pe_new:.2f}\n"
         msg += f"   • P&L (2 Lots): {pnl_symbol} *₹{pnl:,.2f}* ({'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%)\n\n"
 
     pnl_all_symbol = "🟢" if total_pnl >= 0 else "🔴"
