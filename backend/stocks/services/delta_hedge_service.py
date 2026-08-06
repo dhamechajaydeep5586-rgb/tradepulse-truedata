@@ -1611,7 +1611,15 @@ def _background_scan(tracked):
             # ── PASS 1: Collect raw metrics for all qualifying stocks ──
             raw_candidates = []   # list of dicts with symbol + raw metric values
 
-            for symbol in NIFTY_50_STOCKS():
+            # Same earnings/F&O-ban exclusion intraday_service.py and
+            # option_buying_service.py already apply — this scanner never did, despite
+            # a short strangle being the single worst position to hold into an earnings
+            # surprise (both legs exposed, no directional hedge). Reuses the existing
+            # filter, doesn't reinvent it.
+            from stocks.services.event_filter_service import filter_symbols
+            scan_universe, _excluded_today = filter_symbols(NIFTY_50_STOCKS())
+
+            for symbol in scan_universe:
                 if symbol in ['NIFTY', 'BANKNIFTY', 'FINNIFTY']: continue
                 if symbol in tracked: continue
 
