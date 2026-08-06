@@ -478,6 +478,9 @@ class TrueDataService:
             url = f"{MASTER_BASE}/getunderlyinglist"
             params = {"segment": "fo", "user": self.username, "password": self.password}
             response = self._rest_request("GET", url, params=params, timeout=15)
+            if response.status_code in (403, 429) or (response.status_code == 200 and _is_quota_exceeded(response)):
+                logger.error("[TRUEDATA] Rate limit detected during getunderlyinglist fetch.")
+                return []
             if response.status_code != 200:
                 logger.error("[TRUEDATA] getunderlyinglist HTTP %s", response.status_code)
                 return []
