@@ -35,10 +35,11 @@ OPTION_BUYING_TIME_STOP = time(14, 30)
 # Existing ACTIVE/PENDING positions are unaffected — only new-signal generation stops
 # earlier; INTRADAY_SIGNAL_CUTOFF and OPTION_BUYING_TIME_STOP still govern force-close.
 INTRADAY_GENERATION_CUTOFF = time(14, 30)      # 50 min of runway before the 3:20 PM force-close
-OPTION_BUYING_GENERATION_CUTOFF = time(13, 0)  # 90 min of runway before the 2:30 PM force-close
-                                                # (wider buffer than intraday's since options
-                                                # need a bigger move, faster, to clear entry
-                                                # cost + reach a 1.6x-2.0x premium target)
+# Was 13:00 (90 min runway) -- account owner requested more of the day stays open for new
+# option-buying entries (2026-08-06); narrowed to 45 min. Still real runway to clear entry
+# cost + move toward target, just less margin than before -- push later again only with an
+# explicit ask, this trades win-rate for signal count on purpose.
+OPTION_BUYING_GENERATION_CUTOFF = time(13, 45)  # 45 min of runway before the 2:30 PM force-close
 
 # Skip the noisy opening range before allowing the FIRST generation attempt of the day.
 # 9:15-9:45 AM is dominated by gap-driven price discovery — VAH/VAL/POC crosses in this
