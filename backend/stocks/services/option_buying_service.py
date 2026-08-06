@@ -468,26 +468,20 @@ def get_option_buying_signals(action: str | None = None) -> dict[str, Any]:
     if now_ist.time() < OPTION_BUYING_GENERATION_START:
         return _live_option_buying_payload()
 
-    # Bounded-retry generation cap (added 2026-07-29 as a one-shot-per-day gate;
-    # audit fix M10 relaxed it to a bounded retry — see intraday_service.py's
-    # get_live_signals() for the full rationale, mirrored here). Gates on whether
-    # generation has been attempted enough times today AND whether anything from
-    # today already exists, not on a single boolean "was it ever tried" flag — a
-    # day with zero qualifying candidates on the first attempt now gets a few more
-    # tries through the session instead of going silent until tomorrow. Explicit
-    # action="generate" (Force Scan) still bypasses this.
+    # Retry every periodic tick (~15 min, same as the specialist/strangle scanner)
+    # until a signal actually lands, not just a handful of attempts then going
+    # silent for the rest of the window. Was capped at OPTION_BUYING_MAX_GENERATION_
+    # ATTEMPTS (4) regardless of today_has_any_signal — same "stop too early" bug
+    # class as delta_hedge_service's today_spec_exists gate, fixed the same way:
+    # gate on whether a real signal exists, not on an attempt counter.
     today_key = now_ist.date().isoformat()
     generation_attempted_key = f"option_buying_generation_attempts_{today_key}"
-    MAX_GENERATION_ATTEMPTS_PER_DAY = int(getattr(settings, "OPTION_BUYING_MAX_GENERATION_ATTEMPTS", 4))
     attempts_so_far = cache.get(generation_attempted_key, 0)
     is_first_attempt_today = attempts_so_far == 0
     today_has_any_signal = SignalHistory.objects.filter(
         category=CATEGORY, generated_at__date=now_ist.date(),
     ).exists()
-    generation_already_attempted = (
-        today_has_any_signal or attempts_so_far >= MAX_GENERATION_ATTEMPTS_PER_DAY
-    )
-    resolved_action = action or ("update" if generation_already_attempted else "generate")
+    resolved_action = action or ("update" if today_has_any_signal else "generate")
 
     if resolved_action == "update":
         return _live_option_buying_payload()
