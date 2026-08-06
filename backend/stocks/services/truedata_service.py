@@ -485,11 +485,16 @@ class TrueDataService:
                 logger.error("[TRUEDATA] getunderlyinglist HTTP %s", response.status_code)
                 return []
             text = response.text.strip()
-            # Documented as csv/plain list of names, one per line or comma-separated.
+            # Documented as csv/plain list of names, one per line or comma-separated —
+            # but the live response is actually 2-column CSV per line ("ADANIENT,NSE"),
+            # not a bare symbol. Splitting only on the flat single-line case and taking
+            # whole lines otherwise (previous behavior) returned "ADANIENT,NSE" as the
+            # "symbol", which never matches anything in a NIFTY50 set — silently zeroing
+            # out every caller's F&O universe. Take the first CSV column on every line.
             if "," in text and "\n" not in text:
                 names = [n.strip() for n in text.split(",")]
             else:
-                names = [line.strip() for line in text.splitlines() if line.strip()]
+                names = [line.split(",")[0].strip() for line in text.splitlines() if line.strip()]
             return sorted({n for n in names if n and not n.lower().startswith("symbol")})
         except Exception as e:
             logger.error("[TRUEDATA] get_fo_stocks failed: %s", e)
