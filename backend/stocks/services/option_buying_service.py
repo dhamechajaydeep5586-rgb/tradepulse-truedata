@@ -227,6 +227,13 @@ def _live_option_buying_payload() -> dict[str, Any]:
         "signals": signals,
         "signal_for": "Local DB live signals",
         "timestamp": datetime.now(tz=IST).isoformat(),
+        # Every caller reaches this function only after get_option_buying_signals()'s
+        # own is_market_open() check already confirmed OPEN (the two CLOSED cases
+        # return early before ever calling this) — hardcoding it here means the
+        # 4 call sites that used to forget to patch it on (leaving the frontend's
+        # `data?.market_status || "CLOSED"` fallback to wrongly show "MARKET CLOSED"
+        # during a plain poll) can't regress again.
+        "market_status": "OPEN",
     }
 
 
