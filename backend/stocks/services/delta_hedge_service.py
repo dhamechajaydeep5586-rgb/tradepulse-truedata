@@ -1954,11 +1954,19 @@ def get_hedge_panel_data(action: str | None = None, sync_scan: bool = False) -> 
         cached_panel = cache.get("delta_hedge_panel_live_5s")
         if cached_panel and action != "generate" and not sync_scan: return cached_panel
 
-        # Determine resolved action with database-backed idempotency for NSE Specialist Equities
-        today_spec_exists = SignalHistory.objects.filter(
+        # Determine resolved action with database-backed idempotency for NSE Specialist Equities.
+        # Was `.exists()` (any signal today, of any status) -- flipped to "update" forever
+        # after the first position, so _background_scan()'s own target_count/slots_remaining
+        # logic (already built to fill up to HEDGE_MAX_SIGNALS concurrent positions per run)
+        # only ever got invoked once a day. Gate on the actual live count vs the cap instead,
+        # so later periodic ticks keep generating until the day's slots are actually full.
+        target_count = getattr(settings, "HEDGE_MAX_SIGNALS", 10)
+        today_spec_count = SignalHistory.objects.filter(
             category='specialist',
+            status__in=[SignalHistory.Status.ACTIVE, SignalHistory.Status.PENDING],
             generated_at__date=timezone.now().astimezone(IST).date()
-        ).exists()
+        ).count()
+        today_spec_exists = today_spec_count >= target_count
 
         resolved_action = action
         if resolved_action is None:
