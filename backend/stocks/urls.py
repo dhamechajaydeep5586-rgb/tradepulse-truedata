@@ -2,7 +2,6 @@ from django.urls import path
 
 from .views import (
     LiveSignalView,
-    OptionChainView,
     LivePriceUpdateView,
     PerformanceReportView,
     SignalBacktestView,
@@ -18,7 +17,6 @@ app_name = 'stocks'
 
 urlpatterns = [
     path('live-signals/', LiveSignalView.as_view(), name='live-signals'),
-    path('option-chain/', OptionChainView.as_view(), name='option-chain'),
     path('live-price-updates/', LivePriceUpdateView.as_view(), name='live-price-updates'),
     path('performance-report/', PerformanceReportView.as_view(), name='performance-report'),
     path('signal-backtest/', SignalBacktestView.as_view(), name='signal-backtest'),

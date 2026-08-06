@@ -12,7 +12,6 @@ from .serializers import SignalHistorySerializer
 from stocks.services.intraday_service import get_live_signals
 from stocks.services.live_signal_service import get_latest_prices, update_signal_outcomes, get_performance_report
 from stocks.services.signal_utils import IST, is_market_open
-from stocks.services.option_chain_service import get_option_chain, get_option_chain_db_snapshot
 from stocks.services.trading_engine import candles_to_dataframe, get_market_rules, run_backtest_for_signal
 
 # LivePriceUpdateView's server-side symbol cap. The frontend poller already limits
@@ -115,54 +114,6 @@ class SignalBacktestView(APIView):
             return Response({"detail": f"Backtest failed: {exc}"}, status=400)
 
         return Response(result)
-
-
-class OptionChainView(APIView):
-    """GET /api/stocks/option-chain/?symbol=NIFTY"""
-    permission_classes = (IsAuthenticated,)
-
-    def get(self, request):
-        from django.core.cache import cache
-        # Local import removed as it is now at top-level
-        symbol = request.query_params.get('symbol', 'NIFTY').upper()
-        force = request.query_params.get('force', 'false').lower() == 'true'
-        cache_key = f'option_chain_{symbol}_5m'
-
-        # Audit fix M20: OptionChainTable.jsx used to reimplement its own
-        # clock-only "is market open" check to decide whether to keep polling —
-        # contradicting this project's single-source-of-truth rule (NSE API via
-        # is_market_open(), not a client-side clock with no holiday awareness).
-        # Every response branch below carries this so the frontend can gate its
-        # poller on the same real signal every sibling engine's frontend already
-        # uses, instead of guessing from wall-clock time.
-        market_status = "OPEN" if is_market_open() else "CLOSED"
-
-        if not force:
-            cached_data = cache.get(cache_key)
-            if cached_data:
-                cached_data["market_status"] = market_status
-                return Response(cached_data)
-
-        # If market is closed, don't fetch new data
-        if not is_market_open():
-            # Return cached data if available
-            cached_data = cache.get(cache_key)
-            if cached_data:
-                cached_data["market_status"] = market_status
-                return Response(cached_data)
-
-            # Fallback to the latest saved record in the database
-            snapshot = get_option_chain_db_snapshot(symbol)
-            if snapshot:
-                snapshot["market_status"] = market_status
-                return Response(snapshot)
-
-            return Response({"market_status": market_status})
-
-        data = get_option_chain(symbol)
-        cache.set(cache_key, data, timeout=60 * 5)  # Cache for 5 minutes
-        data["market_status"] = market_status
-        return Response(data)
 
 
 class LivePriceUpdateView(APIView):
