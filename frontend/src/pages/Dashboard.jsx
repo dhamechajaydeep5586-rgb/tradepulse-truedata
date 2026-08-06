@@ -2,11 +2,7 @@ import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import API from "../api/axios";
-import GlobalMarketCard from "../components/GlobalMarketCard";
 import DomesticMarketCard from "../components/DomesticMarketCard";
-import MarketBiasSummary from "../components/MarketBiasSummary";
-import AIInsightBox from "../components/AIInsightBox";
-import FIIDIICard from "../components/FIIDIICard";
 import OptionChainTable from "../components/OptionChainTable";
 import NotificationBell from "../components/NotificationBell";
 import SignalPreviewCard from "../components/SignalPreviewCard";
@@ -114,17 +110,6 @@ export default function Dashboard() {
       <main className="mx-auto max-w-7xl space-y-8 px-4 py-6 sm:px-6">
         {/* ── Top Snapshot: Domestic Hub ── */}
         <DomesticMarketCard />
-
-        {/* ── Global Markets ── */}
-        <GlobalMarketCard date={selectedDate} />
-
-        {/* ── Market Context & AI Insights ── */}
-        <div className="grid gap-6 lg:grid-cols-3">
-          <MarketBiasSummary date={selectedDate} />
-          <div className="lg:col-span-2">
-            <AIInsightBox date={selectedDate} />
-          </div>
-        </div>
 
         {/* ── Signal Category Previews ── */}
         <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-3">
@@ -234,9 +219,6 @@ export default function Dashboard() {
           />
 
         </div>
-
-        {/* ── FII / DII Activity ── */}
-        <FIIDIICard />
 
         {/* ── Option Chain ── */}
         <OptionChainTable />

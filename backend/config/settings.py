@@ -100,8 +100,6 @@ INSTALLED_APPS = [
     # Local apps
     'users.apps.UsersConfig',
     'stocks.apps.StocksConfig',
-    'global_market.apps.GlobalMarketConfig',
-    'insights.apps.InsightsConfig',
 ]
 
 MIDDLEWARE = [
@@ -312,31 +310,6 @@ NSE_FO_BHAVCOPY_URL = (
 # Volume spike
 VOLUME_SPIKE_LOOKBACK_DAYS = 20
 
-MARKET_BIAS_BULLISH_THRESHOLD = 0.25
-MARKET_BIAS_BEARISH_THRESHOLD = -0.25
-
-# Signal scoring weights  (must sum to 1.0)
-SIGNAL_WEIGHTS = {
-    'price_change': 0.25,
-    'volume_spike': 0.25,
-    'oi_change': 0.20,
-    'delivery_pct': 0.15,
-    'market_bias': 0.15,
-}
-SIGNAL_BUY_THRESHOLD = 60
-SIGNAL_SELL_THRESHOLD = 40
-
-# Factor normalisation ranges  (min, max) for linear interpolation to 0-100
-SIGNAL_FACTOR_RANGES = {
-    'price_change': (-5.0, 5.0),       # percent
-    'volume_spike': (0.0, 5.0),         # ratio
-    'oi_change': (-1_000_000, 1_000_000),
-    'delivery_pct': (0.0, 100.0),       # already 0-100
-}
-
-# Claude API  (for AI insight generation)
-CLAUDE_API_KEY = os.getenv('CLAUDE_API_KEY', '')
-
 # ──────────────────────────────────────────────
 # LOGGING
 # ──────────────────────────────────────────────
@@ -375,16 +348,6 @@ LOGGING = {
     'handlers': _handlers,
     'loggers': {
         'stocks.services': {
-            'handlers': _handler_names,
-            'level': 'INFO',
-            'propagate': False,
-        },
-        'global_market.services': {
-            'handlers': _handler_names,
-            'level': 'INFO',
-            'propagate': False,
-        },
-        'insights.services': {
             'handlers': _handler_names,
             'level': 'INFO',
             'propagate': False,

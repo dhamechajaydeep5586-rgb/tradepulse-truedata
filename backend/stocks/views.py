@@ -13,7 +13,6 @@ from stocks.services.intraday_service import get_live_signals
 from stocks.services.live_signal_service import get_latest_prices, update_signal_outcomes, get_performance_report
 from stocks.services.signal_utils import IST, is_market_open
 from stocks.services.option_chain_service import get_option_chain, get_option_chain_db_snapshot
-from stocks.services.fii_dii_service import get_fii_dii_data
 from stocks.services.trading_engine import candles_to_dataframe, get_market_rules, run_backtest_for_signal
 
 # LivePriceUpdateView's server-side symbol cap. The frontend poller already limits
@@ -166,13 +165,6 @@ class OptionChainView(APIView):
         return Response(data)
 
 
-class FIIDIIView(APIView):
-    """GET /api/stocks/fii-dii/"""
-    permission_classes = (IsAuthenticated,)
-
-    def get(self, request):
-        data = get_fii_dii_data()
-        return Response(data)
 class LivePriceUpdateView(APIView):
     """GET /api/stocks/live-price-updates/?symbols=RELIANCE,ACC"""
     permission_classes = (IsAuthenticated,)

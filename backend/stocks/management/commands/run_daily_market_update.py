@@ -1,13 +1,10 @@
 """
 Management command: run_daily_market_update
 
-Runs the full TradePulse daily pipeline for a given date:
+Runs the daily TradePulse analytics pipeline for a given date:
 
-  1. Fetch global market data    → GlobalMarket model
-  2. Calculate market bias       → GlobalMarket.market_bias
-  3. Generate AI insight         → Insight model (via Claude API)
-  4. Save Option Chain Snapshots → OptionChain model
-  5. Log success
+  1. Save Option Chain Snapshots → OptionChain model
+  2. Log success
 
 Usage:
   python manage.py run_daily_market_update
@@ -16,7 +13,7 @@ Usage:
 
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date
 
 from django.core.management.base import BaseCommand, CommandError
 
@@ -24,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
-    help = "Run the daily market analytics pipeline (Global Market & AI Insights)."
+    help = "Run the daily market analytics pipeline (Option Chain Snapshots)."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -32,12 +29,6 @@ class Command(BaseCommand):
             type=str,
             default=None,
             help="Target date in YYYY-MM-DD format. Defaults to today.",
-        )
-        parser.add_argument(
-            "--skip-ai",
-            action="store_true",
-            default=False,
-            help="Skip AI insight generation.",
         )
 
     def handle(self, *args, **options):
@@ -53,38 +44,9 @@ class Command(BaseCommand):
 
         logger.info("=== Starting daily pipeline for %s ===", target_date)
 
-        # ── Step 1: Fetch global market data ─────────────────────
-        gm_status = self._run_step(
-            step=1,
-            label="Fetch global market data",
-            func=self._step_global_market,
-            target_date=target_date,
-        )
-
-        # ── Step 2: Calculate market bias ────────────────────────
-        bias = self._run_step(
-            step=2,
-            label="Calculate market bias",
-            func=self._step_market_bias,
-            target_date=target_date,
-        )
-
-        # ── Step 3: Generate AI insight ──────────────────────────
-        if options["skip_ai"]:
-            ai_status = "skipped (--skip-ai flag)"
-            self.stdout.write(f"  [3/4] Generate AI insight ... {ai_status}")
-        else:
-            ai_status = self._run_step(
-                step=3,
-                label="Generate AI insight",
-                func=self._step_ai_insight,
-                target_date=target_date,
-                critical=False,
-            )
-
-        # ── Step 4: Save Option Chain Snapshots ──────────────────
+        # ── Step 1: Save Option Chain Snapshots ──────────────────
         oc_status = self._run_step(
-            step=4,
+            step=1,
             label="Save Option Chain Snapshots",
             func=self._step_option_chain,
             target_date=target_date,
@@ -97,9 +59,6 @@ class Command(BaseCommand):
         self.stdout.write("")
         self.stdout.write(self.style.NOTICE("  Summary:"))
         self.stdout.write(f"    Target date        : {target_date}")
-        self.stdout.write(f"    Global market      : {gm_status}")
-        self.stdout.write(f"    Market bias        : {bias}")
-        self.stdout.write(f"    AI insight         : {ai_status}")
         self.stdout.write(f"    Option snapshots   : {oc_status}")
         self.stdout.write(f"    Elapsed time       : {elapsed:.1f}s")
         self.stdout.write("")
@@ -118,7 +77,7 @@ class Command(BaseCommand):
         return date.today()
 
     def _run_step(self, step: int, label: str, func, target_date: date, critical: bool = True):
-        self.stdout.write(f"  [{step}/4] {label} ...", ending=" ")
+        self.stdout.write(f"  [{step}/1] {label} ...", ending=" ")
         try:
             result = func(target_date)
             display = str(result)
@@ -133,24 +92,6 @@ class Command(BaseCommand):
                 msg = f"failed ({exc})"
                 self.stdout.write(self.style.WARNING(msg))
                 return msg
-
-    @staticmethod
-    def _step_global_market(target_date: date) -> str:
-        from global_market.services import fetch_global_market_data
-        gm = fetch_global_market_data(target_date)
-        return f"OK (id={gm.pk})" if gm else "no data"
-
-    @staticmethod
-    def _step_market_bias(target_date: date) -> str:
-        from global_market.services import calculate_market_bias_for_date
-        bias = calculate_market_bias_for_date(target_date)
-        return bias or "N/A"
-
-    @staticmethod
-    def _step_ai_insight(target_date: date) -> str:
-        from insights.services import generate_daily_insight
-        insight = generate_daily_insight(target_date)
-        return f"generated (id={insight.pk})" if insight else "skipped"
 
     @staticmethod
     def _step_option_chain(target_date: date) -> str:
