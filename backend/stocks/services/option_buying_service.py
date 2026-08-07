@@ -92,17 +92,33 @@ def _option_breakout_logic(
     vol_min = 1.2 if relaxed else 1.5
     adx_min = 15 if relaxed else 20
 
-    direction = None
-    reason = ""
-    if prev_price <= vah and price > vah and vol_ratio > vol_min and price > cur_vwap and adx > adx_min:
-        direction = "BUY_CE"
-        reason = "Value Area Bullish Breakout, VWAP+ADX confirmed"
-    elif prev_price >= val and price < val and vol_ratio > vol_min and price < cur_vwap and adx > adx_min:
-        direction = "BUY_PE"
-        reason = "Value Area Bearish Breakdown, VWAP+ADX confirmed"
-
-    if not direction:
+    # Crossing check first, threshold checks second — lets a symbol that crossed VAH/VAL
+    # but failed on volume/ADX/VWAP log exactly which gate stopped it, instead of the old
+    # single boolean expression that silently returned None either way. A symbol that
+    # never crossed at all (the overwhelming majority every cycle) stays silent here —
+    # not actionable detail, would just be log noise.
+    crossed_up = prev_price <= vah and price > vah
+    crossed_down = prev_price >= val and price < val
+    if not crossed_up and not crossed_down:
         return None
+
+    side = "BUY_CE" if crossed_up else "BUY_PE"
+    vwap_ok = price > cur_vwap if crossed_up else price < cur_vwap
+    fails = []
+    if not (vol_ratio > vol_min):
+        fails.append(f"vol_ratio={vol_ratio:.2f}(<{vol_min})")
+    if not (adx > adx_min):
+        fails.append(f"ADX={adx:.1f}(<{adx_min})")
+    if not vwap_ok:
+        fails.append(f"VWAP={'price below VWAP' if crossed_up else 'price above VWAP'}")
+
+    if fails:
+        logger.info("[OPTION_BUYING][REJECT] %s: crossed %s but failed %s", ticker_sym, side, ", ".join(fails))
+        return None
+
+    direction = side
+    reason = "Value Area Bullish Breakout, VWAP+ADX confirmed" if crossed_up else "Value Area Bearish Breakdown, VWAP+ADX confirmed"
+    logger.info("[OPTION_BUYING][SCREEN] %s: breakout confirmed side=%s vol_ratio=%.2f adx=%.1f", ticker_sym, side, vol_ratio, adx)
 
     return {
         "direction": direction,
@@ -127,14 +143,17 @@ def select_option_buying_strike(symbol: str, spot: float, direction: str, svc) -
 
     atm_strike = svc.get_nearest_strike(symbol, spot)
     if not atm_strike:
+        logger.info("[OPTION_BUYING][REJECT] %s: no tradable strike near spot=%.2f", symbol, spot)
         return None
 
     quote = svc.get_option_quote(symbol, atm_strike, option_type)
     if not quote or not quote.get("ltp"):
+        logger.info("[OPTION_BUYING][REJECT] %s: no option quote for strike=%s type=%s", symbol, atm_strike, option_type)
         return None
 
     premium = round_to_tick(float(quote["ltp"]))
     if premium <= 0:
+        logger.info("[OPTION_BUYING][REJECT] %s: quote premium<=0 strike=%s type=%s", symbol, atm_strike, option_type)
         return None
 
     expiry_str = quote.get("expiry")
@@ -541,6 +560,12 @@ def get_option_buying_signals(action: str | None = None) -> dict[str, Any]:
 
     signals_persisted = 0
     newly_created: list = []
+    # Funnel counters (account owner's request, 2026-08-07): a bare "no signal today"
+    # gave no way to tell whether the bottleneck was thin candle data, the breakout
+    # filter, strike/delta selection, or bad target/SL math. Logged as one summary
+    # line per scan below; per-symbol REJECT detail comes from _option_breakout_logic
+    # and select_option_buying_strike themselves.
+    scan_stats = {"no_bars": 0, "no_breakout": 0, "no_strike": 0, "bad_target_sl": 0, "errors": 0}
     for s in scan_symbols:
         if signals_persisted >= MAX_OPTION_BUY_SIGNALS_PER_SCAN:
             break
@@ -556,20 +581,26 @@ def get_option_buying_signals(action: str | None = None) -> dict[str, Any]:
             # today's own bars to accumulate, same as any cold start.
             df = candle_store.load_bars(s, "FIVE_MINUTE", now_ist - timedelta(days=2), exchange="NSE")
             if df.empty or len(df) < 10:
+                scan_stats["no_bars"] += 1
                 continue
 
             breakout = _option_breakout_logic(s, df, relaxed=is_fallback)
             if not breakout:
+                scan_stats["no_breakout"] += 1
                 continue
 
             spot = breakout["price"]
             strike_info = select_option_buying_strike(s, spot, breakout["direction"], svc)
             if not strike_info:
+                scan_stats["no_strike"] += 1
                 continue
 
             entry_premium = strike_info["premium"]
             target, sl = _compute_target_sl(s, entry_premium)
             if target <= entry_premium or sl >= entry_premium or sl <= 0:
+                scan_stats["bad_target_sl"] += 1
+                logger.info("[OPTION_BUYING][REJECT] %s: non-viable target/SL entry=%.2f target=%.2f sl=%.2f",
+                            s, entry_premium, target, sl)
                 continue
 
             result = {
@@ -609,8 +640,16 @@ def get_option_buying_signals(action: str | None = None) -> dict[str, Any]:
             logger.info("[OPTION_BUYING] Persisted %s %s strike=%s premium=%.2f target=%.2f sl=%.2f",
                         s, result["option_type"], result["strike_price"], entry_premium, target, sl)
         except Exception as e:
+            scan_stats["errors"] += 1
             logger.error("[OPTION_BUYING] Error scanning %s: %s", s, e, exc_info=True)
             continue
+
+    logger.info(
+        "[OPTION_BUYING][SCAN_DONE] scanned=%d persisted=%d | no_bars=%d no_breakout=%d no_strike=%d bad_target_sl=%d errors=%d",
+        len(scan_symbols), signals_persisted,
+        scan_stats["no_bars"], scan_stats["no_breakout"], scan_stats["no_strike"],
+        scan_stats["bad_target_sl"], scan_stats["errors"],
+    )
 
     if newly_created:
         try:

@@ -245,9 +245,13 @@ tested, now a believable ~42% SIDEWAYS / 29% BEARISH / 29% BULLISH split. If you
    resulting **delta between 0.40–0.60** — buyers need the option to actually track the
    underlying, unlike strangle-selling's deep-OTM/high-theta target band. Rejected if outside
    that range even if the breakout itself qualified.
-10. Target/SL (`_compute_target_sl`): target scales **1.6×–2.0× entry premium** with ADX
-    strength (stronger trend → closer to 2.0×); SL is a fixed **0.625× entry premium** — the
-    downside (theta/premium risk) doesn't scale with trend strength the way the reward does.
+10. Target/SL (`_compute_target_sl`): **fixed 2-lot rupee amounts** — target +₹5,000, SL
+    −₹2,500 (clean 1:2 reward:risk), converted to a premium-price delta via the symbol's
+    real lot size. Replaced the old ADX-scaled 1.6×–2.0×-entry target / fixed 0.625×-entry
+    SL formula 2026-07-31 at the account owner's request, after that formula let one real
+    position (SUNPHARMA CE) run to +₹8,785 unrealized with no exit condition anywhere near
+    that level before decaying back to a loss by the 2:30 PM time-stop. See
+    `doc/OPTION_BUYING_PIPELINE.md` for the full pipeline writeup.
 11. Cap: **3 signals max** per scan (`MAX_OPTION_BUY_SIGNALS_PER_SCAN`).
 12. Entry is immediate at the live premium already fetched — unlike equity signals, there's no
     PENDING state to wait through; a persisted option-buying signal starts ACTIVE.
