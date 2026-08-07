@@ -2636,6 +2636,26 @@ def process_legs(section, legs, orch, panel_data, persist_updates=False, sig_id=
             except Exception as ts_err:
                 pass
 
+            # Last-known-good fallback (found 2026-08-07, EOD square-off incident):
+            # both the live quote AND the theoretical calc above can fail in the same
+            # call — most commonly a rate-limit burst right at EOD square-off, when
+            # several positions close within the same scan cycle. Previously this fell
+            # straight through to the hard-zero "prevent ghost profit" guard below,
+            # which is correct when NO real price is known, but wrong when one already
+            # is: _stale_check_cmp holds this leg's last successfully fetched premium
+            # (set every poll below once cmp>0), so a leg that had genuinely decayed
+            # toward zero (a real, favorable outcome for a short seller) got its actual
+            # profit thrown away and reported as a flat Rs.0 instead of survived.
+            if cmp <= 0:
+                last_known = leg.get('_stale_check_cmp')
+                if last_known and float(last_known) > 0:
+                    cmp = float(last_known)
+                    leg['is_theoretical'] = True
+                    logger.warning(
+                        "[LKG_FALLBACK] %s %s %s: quote+theoretical both failed, using last known cmp=%.2f",
+                        symbol, leg.get('strike'), leg.get('option_type'), cmp,
+                    )
+
         # 1b. Refresh live Delta for risk monitoring. make_leg_entry() only sets
         # 'delta' once, at entry/roll time — every panel refresh after that was
         # comparing SHORT_DELTA_DANGER against that frozen snapshot instead of the
