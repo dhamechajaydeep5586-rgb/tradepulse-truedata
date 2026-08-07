@@ -634,10 +634,24 @@ class TrueDataService:
         return min(strikes, key=lambda x: abs(x - target_price))
 
     def _nearest_expiry(self, symbol: str) -> str | None:
+        # Shares the same breaker get_bulk_quotes() trips (audit fix, 2026-08-07):
+        # this endpoint had no circuit-breaker awareness at all, so a rate-limit
+        # storm tripped by a heavy specialist-scanner warm-up (100+ quotes per
+        # candidate) left this call free to keep firing into the same limit —
+        # each failure silently returned None with zero log trace, misattributing
+        # a real breakout (e.g. TITAN) to "no tradable strike" instead of the
+        # actual cause. See doc/OPTION_BUYING_PIPELINE.md.
+        if time.time() < _REST_CIRCUIT_BREAKER_UNTIL["quote"]:
+            logger.warning("[TRUEDATA] CIRCUIT BREAKER ACTIVE - skipping expiry lookup for symbol=%s", symbol)
+            return None
         self._ensure_fresh_token()
         try:
             url = f"{HISTORY_BASE}/getSymbolExpiryList"
             response = self._rest_request("GET", url, params={"symbol": symbol, "response": "csv"}, timeout=15)
+            if response.status_code in (403, 429) or (response.status_code == 200 and _is_quota_exceeded(response)):
+                _REST_CIRCUIT_BREAKER_UNTIL["quote"] = time.time() + 300
+                logger.error("[TRUEDATA] Rate limit detected during expiry lookup for %s. Disabled quote endpoints for 5 minutes.", symbol)
+                return None
             if response.status_code != 200:
                 return None
             lines = [l.strip() for l in response.text.strip().splitlines() if l.strip()]
@@ -647,11 +661,18 @@ class TrueDataService:
             return None
 
     def _option_chain_strikes(self, symbol: str, expiry: str) -> list[float]:
+        if time.time() < _REST_CIRCUIT_BREAKER_UNTIL["quote"]:
+            logger.warning("[TRUEDATA] CIRCUIT BREAKER ACTIVE - skipping option chain lookup for symbol=%s", symbol)
+            return []
         self._ensure_fresh_token()
         try:
             url = f"{MASTER_BASE}/getoptionchain"
             params = {"user": self.username, "password": self.password, "symbol": symbol, "expiry": expiry, "csv": "true"}
             response = self._rest_request("GET", url, params=params, timeout=15)
+            if response.status_code in (403, 429) or (response.status_code == 200 and _is_quota_exceeded(response)):
+                _REST_CIRCUIT_BREAKER_UNTIL["quote"] = time.time() + 300
+                logger.error("[TRUEDATA] Rate limit detected during option chain lookup for %s. Disabled quote endpoints for 5 minutes.", symbol)
+                return []
             if response.status_code != 200:
                 return []
             # Headerless positional CSV — see get_option_chain's column comment.
@@ -682,11 +703,18 @@ class TrueDataService:
                 return None
             expiry = self._to_ddmmyyyy(expiry)
 
+        if time.time() < _REST_CIRCUIT_BREAKER_UNTIL["quote"]:
+            logger.warning("[TRUEDATA] CIRCUIT BREAKER ACTIVE - skipping option quote for symbol=%s", symbol)
+            return None
         self._ensure_fresh_token()
         try:
             url = f"{GREEKS_BASE}/getLTPwithGreeks"
             params = {"symbol": symbol, "expiry": expiry, "strike": target_strike, "series": option_type, "response": "json"}
             response = self._rest_request("GET", url, params=params, timeout=15)
+            if response.status_code in (403, 429) or (response.status_code == 200 and _is_quota_exceeded(response)):
+                _REST_CIRCUIT_BREAKER_UNTIL["quote"] = time.time() + 300
+                logger.error("[TRUEDATA] Rate limit detected during option quote fetch for %s. Disabled quote endpoints for 5 minutes.", symbol)
+                return None
             if response.status_code != 200:
                 logger.error("[TRUEDATA] getLTPwithGreeks HTTP %s for %s", response.status_code, symbol)
                 return None

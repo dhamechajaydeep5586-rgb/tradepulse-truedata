@@ -316,6 +316,8 @@ VOLUME_SPIKE_LOOKBACK_DAYS = 20
 # Production (Render): stdout only — captured by Render's log aggregator.
 # Local development: set LOG_TO_FILE=true in .env to enable rotating file logs
 # stored in BASE_DIR/logs/ (max 10 MB per file, 5 backups = 50 MB ceiling).
+import logging
+import time
 import logging.handlers as _lh
 
 _LOG_TO_FILE = os.getenv('LOG_TO_FILE', 'false').lower() in ('true', '1', 'yes')
@@ -341,7 +343,7 @@ LOGGING = {
     'disable_existing_loggers': False,
     'formatters': {
         'verbose': {
-            'format': '[{asctime}] {levelname} {name}: {message}',
+            'format': '[{asctime} UTC] {levelname} {name}: {message}',
             'style': '{',
         },
     },
@@ -354,6 +356,11 @@ LOGGING = {
         },
     },
 }
+# Force every log timestamp to real UTC regardless of the underlying OS/container
+# clock — Python's logging.Formatter.converter defaults to time.localtime, so on a
+# host not explicitly set to UTC (or if that ever changes), timestamps would
+# silently start being local time while the "UTC" label above kept lying about it.
+logging.Formatter.converter = time.gmtime
 
 # ──────────────────────────────────────────────
 # PRODUCTION SECURITY HARDENING
