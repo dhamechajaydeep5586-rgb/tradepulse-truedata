@@ -5,6 +5,7 @@ from rest_framework import generics
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.renderers import JSONRenderer
 from rest_framework.throttling import ScopedRateThrottle, UserRateThrottle, AnonRateThrottle
 
 from .models import SignalHistory
@@ -643,6 +644,12 @@ class CronScannerTriggerView(APIView):
     Targeted by external cron services (e.g. cron-job.org).
     """
     permission_classes = (AllowAny,)
+    # JSON-only: a real browser sends Accept: text/html, which pulls in DRF's
+    # default BrowsableAPIRenderer — that renderer crashes on this view (produces
+    # Django's generic 500 page, no useful traceback) while curl/cron-job.org
+    # (Accept: */*) get plain JSON and succeed. This is a cron/machine endpoint;
+    # nobody should be browsing it as HTML anyway.
+    renderer_classes = [JSONRenderer]
 
     def get(self, request):
         import os
