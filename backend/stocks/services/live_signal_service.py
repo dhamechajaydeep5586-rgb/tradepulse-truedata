@@ -7,6 +7,7 @@ This file acts as the primary orchestrator for specialized signal engines.
 from __future__ import annotations
 import logging
 from datetime import datetime, time, timedelta, date
+from django.conf import settings
 from django.core.cache import cache
 from django.utils import timezone as dj_timezone
 
@@ -27,10 +28,12 @@ from stocks.services.delta_hedge_service import get_hedge_panel_data
 
 logger = logging.getLogger(__name__)
 
-# Intraday signals are generated on 5-min bars; 8 bars = 40 minutes. An intraday
-# momentum/mean-reversion setup that hasn't resolved within that window has decayed to
-# roughly zero expected value, so holding it only ties up risk budget.
-INTRADAY_TIME_STOP_MINUTES = 8 * 5
+# Hard rupee P&L cap per position (account owner's request, 2026-08-07, replaces the
+# old 8-bar/40-min time stop): ride toward target/SL with no time limit, but force an
+# exit the instant realised P&L on the position hits +/-this amount, regardless of how
+# far price still is from the level. SQUARE_OFF_CUTOFF still force-closes anything left
+# open at end of day separately (update_signal_outcomes()).
+INTRADAY_HARD_PNL_CAP = float(getattr(settings, "INTRADAY_HARD_PNL_CAP", 3000))
 
 def get_latest_prices(symbols: list[str]) -> dict[str, float]:
     """
@@ -296,14 +299,18 @@ def _audit_intraday_signal(sig, price, now, svc) -> None:
         # Momentum trades: arm break-even / trail for the NEXT cycle's level check.
         _manage_dynamic_stop(sig, bars, now)
 
-        # Time stop — only once the level checks above have confirmed nothing was hit.
-        if sig.active_time:
-            held = (now - sig.active_time).total_seconds() / 60.0
-            if held >= INTRADAY_TIME_STOP_MINUTES:
-                _close_signal(sig, SignalHistory.Status.EXPIRED, price, now, "TIME_STOP")
+        # Hard P&L cap — only once the level checks above have confirmed nothing was
+        # hit. Uses the current live price, same as the old time stop did.
+        qty = float((sig.metadata or {}).get("qty") or 0)
+        if qty > 0:
+            is_buy = sig.signal_type == "BUY"
+            pnl = (price - float(sig.entry_price)) * qty if is_buy else (float(sig.entry_price) - price) * qty
+            if abs(pnl) >= INTRADAY_HARD_PNL_CAP:
+                status = SignalHistory.Status.HIT_TARGET if pnl >= 0 else SignalHistory.Status.HIT_SL
+                _close_signal(sig, status, price, now, "PNL_CAP_HIT")
                 logger.info(
-                    "[INTRADAY][TIME_STOP] %s closed after %.0f min with no resolution.",
-                    sig.symbol, held,
+                    "[INTRADAY][PNL_CAP] %s closed at P&L cap: Rs.%.2f (qty=%.0f).",
+                    sig.symbol, pnl, qty,
                 )
                 return
 

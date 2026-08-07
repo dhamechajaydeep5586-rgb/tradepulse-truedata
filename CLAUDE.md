@@ -63,13 +63,15 @@ PENDING  → ACTIVE → HIT_TARGET
 ### Auto Square-Off Rules (enforced in `live_signal_service.py → update_signal_outcomes`)
 | Category       | Cutoff Time | PENDING action | ACTIVE action |
 |---------------|-------------|----------------|---------------|
-| intraday       | 3:20 PM IST | CANCELLED (no P&L) | HIT_TARGET/HIT_SL on a target/SL touch, detected by scanning **1-min bar high/low** (not an LTP snapshot); 8-bar (40 min) time stop → EXPIRED; anything still ACTIVE at cutoff force-closes as EXPIRED |
+| intraday       | 3:20 PM IST | CANCELLED (no P&L) | HIT_TARGET/HIT_SL on a target/SL touch, detected by scanning **1-min bar high/low** (not an LTP snapshot); hard ±₹3,000 P&L cap on the position (`INTRADAY_HARD_PNL_CAP`) auto-closes as HIT_TARGET/HIT_SL regardless of how far price is from the level; anything still ACTIVE at cutoff force-closes as EXPIRED |
 | commodity      | 11:15 PM IST | CANCELLED | HIT_TARGET/HIT_SL auto-closed on cross; else EXPIRED at cutoff |
 | option_selling | 3:15 PM IST | CANCELLED | HIT_TARGET/HIT_SL auto-closed on cross; else EXPIRED at cutoff |
 
 Every intraday exit records `metadata.exit_reason`: `LEVEL_HIT` (bar-confirmed),
-`LEVEL_HIT_LTP` (degraded fallback when bar data is unavailable), `TIME_STOP`,
-`SQUARE_OFF_CUTOFF`, or `DAILY_LOSS_LIMIT`.
+`LEVEL_HIT_LTP` (degraded fallback when bar data is unavailable), `PNL_CAP_HIT`
+(replaced the old 8-bar/40-min time stop 2026-08-07, account owner's request — a
+position now rides toward target/SL with no time limit, but force-exits the instant
+its rupee P&L hits ±₹3,000), `SQUARE_OFF_CUTOFF`, or `DAILY_LOSS_LIMIT`.
 
 ### Intraday Risk Controls (`intraday_service.py`)
 Positions are sized by **risk, not notional**: `qty = (equity × risk%) / (entry − stop)`.

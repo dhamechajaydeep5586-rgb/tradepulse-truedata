@@ -75,6 +75,7 @@ _EXIT_REASON_LABEL = {
     "LEVEL_HIT": "Target/Stop-Loss Hit",
     "LEVEL_HIT_LTP": "Target/Stop-Loss Hit (degraded, LTP-based)",
     "TIME_STOP": "Time Stop",
+    "PNL_CAP_HIT": "P&L Cap Hit",
     "VWAP_EXIT": "VWAP Target Reached",
     "SQUARE_OFF_CUTOFF": "Session Square-Off",
     "DAILY_LOSS_LIMIT": "Daily Loss Limit Halt",
